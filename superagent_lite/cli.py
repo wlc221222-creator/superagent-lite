@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--worker",
         default=None,
-        help="worker adapter: echo | claude | codex (default: config.default_worker)",
+        help="worker adapter: echo | claude | native | codex (default: config.default_worker)",
     )
     run.add_argument(
         "--timeout",
@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue.add_argument(
         "--worker",
         default=None,
-        help="worker adapter: echo | claude | codex (default: config.default_worker)",
+        help="worker adapter: echo | claude | native | codex (default: config.default_worker)",
     )
     queue.add_argument(
         "--timeout",

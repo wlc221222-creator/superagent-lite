@@ -395,6 +395,22 @@ class Worker(ABC):
     def run(self, ticket: Ticket, workdir: Path) -> WorkerResult: ...
 ```
 
+### Workers
+
+| Worker | What it is |
+| --- | --- |
+| `echo` | Offline stub: echoes the task, writes nothing. Safe default. |
+| `claude` | Shells out to the Claude Code CLI (`claude -p ...`). |
+| `native` | **In-house agent loop.** No external CLI: it calls the Messages API itself, runs the tools (`read_file`, `write_file`, `edit_file`, `bash`, `glob`, `grep`) and applies the same `RESULT` contract. Model from `native_model`, endpoint from `native_settings_path` (defaults to `brain_settings_path`). |
+| `codex` | Placeholder. |
+
+The native worker is the self-contained option: it needs nothing installed
+beyond Python and an Anthropic-compatible endpoint. Every tool path is jailed
+to the ticket's working directory, `bash` runs with an allow-listed
+environment and `native_bash_timeout_seconds`, and the loop stops after
+`native_max_turns` model turns. Pick it with `--worker native` or
+`"brain_worker": "native"`.
+
 ## Quick start
 
 Requirements: Python 3.11+ (developed on 3.12), no third-party packages.
@@ -482,6 +498,10 @@ See `config.example.json` for the full set; the essentials are:
   "claude_allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
   "claude_max_turns": 25,
   "claude_env_passthrough": ["HOME", "PATH", "LANG", "TERM"],
+  "native_model": "cn:deepseek-v4.1-flash",
+  "native_max_turns": 25,
+  "native_settings_path": "~/.claude/settings.json",
+  "native_bash_timeout_seconds": 120,
   "timeout_seconds": 300,
   "stale_seconds": 300,
   "heartbeat_seconds": 15,
@@ -506,7 +526,7 @@ The planner's `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` deliberately do
 
 | Key | Meaning |
 | --- | --- |
-| `default_worker` | Worker used when `--worker` is omitted (`echo`, `claude`, `codex`) |
+| `default_worker` | Worker used when `--worker` is omitted (`echo`, `claude`, `native`, `codex`) |
 | `claude_bin` | Explicit path to the Claude Code executable; wins over discovery. `null` = auto |
 | `claude_binary` | Name/path used for `PATH` and fallback discovery (default `claude`) |
 | `claude_model` | Model passed as `--model`; `null` to use Claude Code's own default |
@@ -515,6 +535,10 @@ The planner's `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` deliberately do
 | `claude_max_turns` | `--max-turns` bound on the agent loop |
 | `claude_permission_mode` | `--permission-mode` (default `acceptEdits`); `null` to omit |
 | `claude_env_passthrough` | Allow-list of parent env vars forwarded to the child |
+| `native_model` | Model name for the in-house native worker |
+| `native_max_turns` | Model turns the native agent loop may use before it fails |
+| `native_settings_path` | Settings file with the API endpoint; defaults to `brain_settings_path` |
+| `native_bash_timeout_seconds` | Per-command timeout for the native worker's `bash` tool |
 | `timeout_seconds` | Per-ticket timeout (a hard kill of the process group) |
 | `stale_seconds` | A `running` ticket whose heartbeat is this old is stale (failed by the CLI, requeued by the daemon) |
 | `heartbeat_seconds` | How often the router refreshes `heartbeat_at` during a run |
@@ -617,6 +641,7 @@ superagent_lite/
 └── workers/
     ├── base.py          # Worker interface, WorkerResult, env allow-list
     ├── claude_code.py   # claude -p adapter (tools, env, timeout)
+    ├── native.py        # in-house agent loop over the Messages API
     ├── echo.py          # offline test worker
     └── codex.py         # placeholder
 tests/
@@ -625,6 +650,7 @@ tests/
 ├── test_daemon.py       # queue → daemon → done, restart, pool, shutdown
 ├── test_brain.py        # planner stub, chat, HTTP API, memory, depends_on
 ├── test_phase4.py       # web UI, artifact download/traversal, Feishu, deploy assets
+├── test_native_worker.py  # scripted-model native loop, tools and path jail
 └── support.py           # stub claude CLI + stub /v1/messages planner
 deploy/
 ├── superagentd.service  # systemd unit for the queue daemon

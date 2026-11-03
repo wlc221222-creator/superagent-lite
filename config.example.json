@@ -28,6 +28,10 @@
     "SSL_CERT_FILE",
     "SSL_CERT_DIR"
   ],
+  "native_model": "cn:deepseek-v4.1-flash",
+  "native_max_turns": 25,
+  "native_settings_path": "~/.claude/settings.json",
+  "native_bash_timeout_seconds": 120,
   "timeout_seconds": 300,
   "stale_seconds": 300,
   "heartbeat_seconds": 15,

@@ -68,6 +68,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # denied.  Set to null to let Claude Code use its own default.
     "claude_permission_mode": "acceptEdits",
     "claude_env_passthrough": list(DEFAULT_ENV_PASSTHROUGH),
+    # The native worker is our own agent loop over the Anthropic-compatible
+    # Messages API -- no external coding-agent CLI.  It reads its endpoint
+    # from the same settings file as the Brain unless overridden here.
+    "native_model": "cn:deepseek-v4.1-flash",
+    "native_max_turns": 25,
+    "native_settings_path": "~/.claude/settings.json",
+    "native_bash_timeout_seconds": 120.0,
     "timeout_seconds": 300.0,
     "stale_seconds": 300.0,
     "heartbeat_seconds": 15.0,
@@ -260,6 +267,32 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError("config.brain_max_tokens must be an integer")
     if config["brain_max_tokens"] <= 0:
         raise ValueError("config.brain_max_tokens must be greater than 0")
+
+    # --- native worker -------------------------------------------------
+    # ``native_settings_path`` deliberately follows ``brain_settings_path``
+    # unless set explicitly: both speak the same Messages endpoint and read it
+    # from the same Claude Code settings file.
+    if values.get("native_settings_path") in (None, ""):
+        config["native_settings_path"] = config["brain_settings_path"]
+    for key in ("native_model", "native_settings_path"):
+        if not isinstance(config[key], str) or not config[key].strip():
+            raise ValueError(f"config.{key} must be a non-empty string")
+        config[key] = config[key].strip()
+    if isinstance(config["native_max_turns"], bool) or not isinstance(
+        config["native_max_turns"], int
+    ):
+        raise ValueError("config.native_max_turns must be an integer")
+    if config["native_max_turns"] <= 0:
+        raise ValueError("config.native_max_turns must be greater than 0")
+    try:
+        bash_timeout = float(config["native_bash_timeout_seconds"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "config.native_bash_timeout_seconds must be a number"
+        ) from exc
+    if bash_timeout <= 0:
+        raise ValueError("config.native_bash_timeout_seconds must be greater than 0")
+    config["native_bash_timeout_seconds"] = bash_timeout
     if isinstance(config["brain_max_tickets"], bool) or not isinstance(
         config["brain_max_tickets"], int
     ):

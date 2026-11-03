@@ -31,7 +31,14 @@ from .result import (
 )
 from .router import Router
 from .store import TicketStore
-from .workers import ClaudeCodeWorker, CodexWorker, EchoWorker, Worker, WorkerResult
+from .workers import (
+    ClaudeCodeWorker,
+    CodexWorker,
+    EchoWorker,
+    NativeWorker,
+    Worker,
+    WorkerResult,
+)
 
 __version__ = "0.2.0"
 
@@ -51,6 +58,7 @@ __all__ = [
     "FeishuMessage",
     "FeishuSettings",
     "MessagesClient",
+    "NativeWorker",
     "Plan",
     "PlanStep",
     "PlannerConfigError",

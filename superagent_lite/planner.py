@@ -145,6 +145,58 @@ class MessagesClient:
     ) -> str:
         """Send one conversation and return the assistant's text."""
 
+        return _extract_text(
+            self._post(
+                model=model,
+                system=system,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+        )
+
+    def messages(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: Sequence[Mapping[str, Any]],
+        max_tokens: int = 2048,
+        temperature: float | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Send one conversation and return the full parsed response.
+
+        Unlike :meth:`complete`, this preserves the whole JSON body -- tool
+        use blocks, ``stop_reason`` and all -- which is what an agent loop
+        needs.  ``tools`` (Anthropic tool definitions) is passed through
+        verbatim when supplied.
+        """
+
+        raw = self._post(
+            model=model,
+            system=system,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools,
+        )
+        if not isinstance(raw, dict):
+            raise PlannerError("planner response must be a JSON object")
+        return raw
+
+    def _post(
+        self,
+        *,
+        model: str,
+        system: str,
+        messages: Sequence[Mapping[str, Any]],
+        max_tokens: int,
+        temperature: float | None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
+    ) -> Any:
+        """POST one Messages payload, retrying transient failures."""
+
         payload: dict[str, Any] = {
             "model": model,
             "max_tokens": int(max_tokens),
@@ -154,6 +206,8 @@ class MessagesClient:
             payload["system"] = system
         if temperature is not None:
             payload["temperature"] = float(temperature)
+        if tools is not None:
+            payload["tools"] = [dict(tool) for tool in tools]
 
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {
@@ -176,7 +230,7 @@ class MessagesClient:
                 method="POST",
             )
             try:
-                raw = self._send(request)
+                return self._send(request)
             except _RetryablePlannerError as exc:
                 last_error = exc
                 if attempt < _MAX_ATTEMPTS:
@@ -185,7 +239,6 @@ class MessagesClient:
                 raise PlannerError(str(exc)) from None
             except PlannerError:
                 raise
-            return _extract_text(raw)
 
         raise PlannerError(str(last_error or "planner request failed"))  # pragma: no cover
 

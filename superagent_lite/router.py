@@ -35,7 +35,14 @@ from .reviewer import (
     should_review,
 )
 from .store import TicketStore, approval_content_hash
-from .workers import ClaudeCodeWorker, CodexWorker, EchoWorker, Worker, WorkerResult
+from .workers import (
+    ClaudeCodeWorker,
+    CodexWorker,
+    EchoWorker,
+    NativeWorker,
+    Worker,
+    WorkerResult,
+)
 
 MAX_SUMMARY_CHARS = 4000
 MAX_ARTIFACTS = 1000
@@ -140,6 +147,20 @@ class Router:
                 max_turns=self.config.get("claude_max_turns", 25),
                 permission_mode=self.config.get("claude_permission_mode", "acceptEdits"),
                 env_passthrough=self.config.get("claude_env_passthrough"),
+                heartbeat_interval=float(self.config.get("heartbeat_seconds", 15.0)),
+            ),
+            # In-house agent loop: drives the model directly instead of
+            # shelling out to an external coding-agent CLI.  It builds its
+            # client lazily, so a missing endpoint fails a ticket, not startup.
+            "native": NativeWorker(
+                model=self.config.get("native_model"),
+                settings_path=self.config.get("native_settings_path")
+                or self.config["brain_settings_path"],
+                max_turns=int(self.config.get("native_max_turns", 25)),
+                bash_timeout_seconds=float(
+                    self.config.get("native_bash_timeout_seconds", 120.0)
+                ),
+                request_timeout=float(self.config.get("timeout_seconds", 300.0)),
                 heartbeat_interval=float(self.config.get("heartbeat_seconds", 15.0)),
             ),
             "codex": CodexWorker(),
