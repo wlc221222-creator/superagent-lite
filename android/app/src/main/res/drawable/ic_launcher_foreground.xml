@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Chat bubble with three dots, white on transparent (adaptive icon fg). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,26 h48 a10,10 0 0 1 10,10 v26 a10,10 0 0 1 -10,10 h-30 l-13,11 v-11 a10,10 0 0 1 -5,-0.6 A10,10 0 0 1 20,62 v-26 a10,10 0 0 1 10,-10 z" />
+    <path
+        android:fillColor="#4D6BFE"
+        android:pathData="M38,44 a4.5,4.5 0 1 1 0.01,0 z M54,44 a4.5,4.5 0 1 1 0.01,0 z M70,44 a4.5,4.5 0 1 1 0.01,0 z" />
+</vector>

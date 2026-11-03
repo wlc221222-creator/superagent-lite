@@ -1,0 +1,5 @@
+// Root build file: only declares the Android Gradle Plugin. Each module
+// applies it itself. AGP 8.5.x requires Gradle 8.7 and JDK 17.
+plugins {
+    id 'com.android.application' version '8.5.2' apply false
+}

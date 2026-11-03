@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SuperAgent Lite</string>
+    <string name="title_settings">设置</string>
+    <string name="title_attention">待处理</string>
+</resources>

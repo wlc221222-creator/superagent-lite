@@ -26,85 +26,98 @@ CHAT_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>superagent-lite</title>
+<title>SuperAgent Lite</title>
 <style>
+  /* Design tokens: DESIGN-BRIEF.md (distilled from DSH panel metrics). */
   :root {
     color-scheme: light dark;
-    --bg: #f5f6f8;
+    --brand: #4d6bfe;
+    --brand-pressed: #3b54d8;
+    --bg: #ffffff;
+    --surface: #f7f8fa;
     --panel: #ffffff;
-    --text: #1d2026;
-    --muted: #6b7280;
-    --line: #d8dbe2;
-    --accent: #2f6feb;
-    --user: #e6efff;
+    --text: #1f2329;
+    --muted: #646a73;
+    --line: #e5e8ec;
+    --user: #4d6bfe;
     --ok: #1a7f4b;
-    --bad: #b42318;
+    --bad: #d64545;
+    --warn: #e8a33d;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #14161a; --panel: #1c1f25; --text: #e7e9ee; --muted: #9aa1ad;
-      --line: #2c313a; --accent: #6f9dff; --user: #23304a;
-      --ok: #58c48a; --bad: #ff8a80;
+      --brand: #6b85ff; --brand-pressed: #4d6bfe;
+      --bg: #17181a; --surface: #232427; --panel: #1d1e21;
+      --text: #e8eaed; --muted: #9aa0a6; --line: #33363b;
+      --user: #4d6bfe;
+      --ok: #58c48a; --bad: #e06060; --warn: #e8a33d;
     }
   }
   * { box-sizing: border-box; }
   body {
     margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.5 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+    font: 14px/1.65 -apple-system, "Segoe UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
   }
-  #app { max-width: 860px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; }
-  header { padding: 18px 16px 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-  header h1 { font-size: 18px; margin: 0 12px 0 0; font-weight: 600; }
+  #app { max-width: 820px; margin: 0 auto; min-height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 16px 16px 8px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0 10px 0 0; font-weight: 600; letter-spacing: .2px; }
   header .hint { color: var(--muted); font-size: 12px; }
   .token-row { display: flex; gap: 8px; margin-left: auto; }
   input, button, textarea { font: inherit; }
   input[type="password"], input[type="text"] {
-    background: var(--panel); color: var(--text); border: 1px solid var(--line);
-    border-radius: 8px; padding: 7px 10px;
+    background: var(--surface); color: var(--text); border: 0.5px solid var(--line);
+    border-radius: 20px; padding: 7px 14px; font-size: 13px;
   }
-  #token { width: 190px; }
+  #token { width: 180px; }
   button {
-    background: var(--accent); color: #fff; border: 0; border-radius: 8px;
-    padding: 8px 14px; cursor: pointer;
+    background: var(--brand); color: #fff; border: 0; border-radius: 20px;
+    padding: 8px 18px; cursor: pointer; font-size: 14px;
   }
+  button:hover { background: var(--brand-pressed); }
   button:disabled { opacity: .55; cursor: default; }
-  button.secondary { background: transparent; color: var(--accent); border: 1px solid var(--line); }
-  main { flex: 1; padding: 4px 16px 16px; overflow-y: auto; }
-  .msg { margin: 12px 0; padding: 10px 12px; border-radius: 10px; background: var(--panel);
-         border: 1px solid var(--line); white-space: pre-wrap; word-break: break-word; }
-  .msg.user { background: var(--user); border-color: transparent; }
-  .msg .meta { color: var(--muted); font-size: 12px; margin-bottom: 4px; white-space: normal; }
+  button.secondary { background: transparent; color: var(--text); border: 0.5px solid var(--line); }
+  button.secondary:hover { background: var(--surface); }
+  main { flex: 1; padding: 8px 16px 16px; overflow-y: auto; display: flex; flex-direction: column; }
+  .msg { margin: 6px 0; padding: 10px 14px; max-width: 84%; align-self: flex-start;
+         border-radius: 4px 16px 16px 16px; background: var(--surface);
+         white-space: pre-wrap; word-break: break-word; }
+  .msg.user { background: var(--user); color: #fff; align-self: flex-end;
+              border-radius: 16px 16px 4px 16px; }
+  .msg .meta { color: var(--muted); font-size: 11px; margin-bottom: 3px; white-space: normal; }
+  .msg.user .meta { color: rgba(255,255,255,.75); }
   .msg .meta .ticket { font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .progress { margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--line);
-              font-size: 13px; color: var(--muted); white-space: normal; }
+  .progress { margin-top: 8px; padding-top: 8px; border-top: 0.5px solid var(--line);
+              font-size: 12.5px; color: var(--muted); white-space: normal; }
   .progress .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
   .state-done { color: var(--ok); }
   .state-failed { color: var(--bad); }
   .artifacts { margin-top: 6px; }
-  .artifacts a { color: var(--accent); margin-right: 12px; cursor: pointer;
+  .artifacts a { color: var(--brand); margin-right: 12px; cursor: pointer;
                  text-decoration: underline; font-size: 13px; }
+  .msg.user .artifacts a { color: #fff; }
   .error { color: var(--bad); }
-  .state-awaiting_approval { color: #b26a00; font-weight: 600; }
-  .attention { margin: 4px 16px 0; padding: 10px 12px; border: 1px dashed var(--line);
-               border-radius: 10px; background: var(--panel); font-size: 13px; }
-  .attention h2 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
-  .attention .row { padding: 3px 0; }
+  .state-awaiting_approval { color: var(--warn); font-weight: 600; }
+  .attention { margin: 8px 16px 0; padding: 14px 16px; border: 0.5px solid var(--line);
+               border-radius: 16px; background: var(--panel); font-size: 13px; }
+  .attention h2 { font-size: 12px; margin: 0 0 8px; color: var(--muted); font-weight: 600; }
+  .attention .row { padding: 4px 0 4px 10px; border-left: 2px solid var(--warn); margin: 6px 0; }
   .attention .tag { display: inline-block; min-width: 116px; color: var(--muted); }
   .attention .id { font-family: ui-monospace, Menlo, Consolas, monospace; }
-  .attention .how { color: var(--muted); margin-top: 6px; }
-  footer { padding: 10px 16px 20px; }
+  .attention .how { color: var(--muted); margin-top: 8px; font-size: 12px; }
+  footer { padding: 10px 16px 18px; }
   .composer { display: flex; gap: 8px; align-items: flex-end; }
   textarea {
-    flex: 1; min-height: 46px; max-height: 180px; resize: vertical; background: var(--panel);
-    color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px;
+    flex: 1; min-height: 44px; max-height: 180px; resize: vertical; background: var(--surface);
+    color: var(--text); border: 0.5px solid var(--line); border-radius: 16px; padding: 10px 14px;
   }
+  #send { height: 44px; padding: 0 22px; }
   .footnote { color: var(--muted); font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
 <div id="app">
   <header>
-    <h1>superagent-lite</h1>
+    <h1>SuperAgent Lite</h1>
     <span class="hint">主智能体控制台</span>
     <div class="token-row">
       <input id="token" type="password" placeholder="访问 token" autocomplete="off">

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brand">#6B85FF</color>
+    <color name="brand_pressed">#4D6BFE</color>
+    <color name="bg">#17181A</color>
+    <color name="surface">#232427</color>
+    <color name="text_primary">#E8EAED</color>
+    <color name="text_secondary">#9AA0A6</color>
+    <color name="border">#33363B</color>
+    <color name="warn">#E8A33D</color>
+    <color name="error">#E06060</color>
+    <color name="on_brand">#FFFFFF</color>
+</resources>
