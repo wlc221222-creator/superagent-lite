@@ -21,9 +21,13 @@ class TicketStatus(str, Enum):
 
 
 def utc_now() -> str:
-    """Return the current UTC time as a sortable ISO-8601 string."""
+    """Return the current UTC time as a sortable ISO-8601 string.
 
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    Millisecond precision keeps heartbeats distinguishable even when a run
+    is shorter than a second.
+    """
+
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 def new_ticket_id() -> str:
@@ -37,8 +41,11 @@ def new_ticket_id() -> str:
 class Ticket:
     """A unit of work dispatched to exactly one worker.
 
-    ``retry_count`` and ``max_retries`` are reserved for the planned
-    automatic-retry / watchdog work; the MVP never changes them.
+    ``attempts`` counts dispatches (1 for the first run), ``started_at`` is
+    set when a dispatch begins and ``heartbeat_at`` is refreshed while the
+    worker runs so that a restarted process can tell a live ticket from one
+    abandoned by a dead process.  ``retry_count`` / ``max_retries`` are
+    reserved for automatic retries.
     """
 
     id: str
@@ -48,14 +55,17 @@ class Ticket:
     workdir: str = ""
     timeout: float = 300.0
     result_summary: str | None = None
+    artifacts: list[str] = field(default_factory=list)
     log_path: str | None = None
     error: str | None = None
     exit_code: int | None = None
+    attempts: int = 0
     retry_count: int = 0
     max_retries: int = 0
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     started_at: str | None = None
+    heartbeat_at: str | None = None
     finished_at: str | None = None
 
     @property

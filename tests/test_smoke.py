@@ -91,7 +91,14 @@ class SmokeTest(unittest.TestCase):
 
     def test_stale_running_ticket_is_recovered_on_restart(self) -> None:
         ticket = self.router.submit("will look interrupted", worker="echo")
-        self.router.store.set_status(ticket.id, "running", error=None)
+        # Simulate a process that died while running: the row stays running
+        # and its heartbeat stops well before the stale threshold.
+        self.router.store.set_status(
+            ticket.id,
+            "running",
+            error=None,
+            heartbeat_at="2000-01-01T00:00:00+00:00",
+        )
         self.router.close()
 
         reopened = Router(config=self.config)
@@ -99,6 +106,7 @@ class SmokeTest(unittest.TestCase):
             loaded = reopened.get(ticket.id)
             self.assertEqual(loaded.status, TicketStatus.FAILED)
             self.assertIn("interrupted", loaded.error)
+            self.assertIn("heartbeat", loaded.error)
         finally:
             reopened.close()
 

@@ -71,9 +71,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _hoist_global_config(argv: list[str]) -> list[str]:
+    """Let ``--config PATH`` appear before or after the sub-command.
+
+    ``argparse`` only accepts it on the common sub-parser, which forces
+    ``show --config X <id>``; users reasonably type ``--config X show <id>``.
+    Only a bare ``--config`` directly followed by a value is hoisted.
+    """
+
+    hoisted: list[str] = []
+    rest: list[str] = []
+    commands = {"run", "list", "show"}
+    index = 0
+    while index < len(argv):
+        if argv[index] == "--config" and index + 1 < len(argv):
+            hoisted.extend(["--config", argv[index + 1]])
+            index += 2
+            continue
+        rest.append(argv[index])
+        index += 1
+    if not rest or rest[0] not in commands:
+        return hoisted + rest
+    # ``--config`` belongs *after* the sub-command for argparse.
+    return [rest[0]] + hoisted + rest[1:]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw = list(sys.argv[1:]) if argv is None else list(argv)
+    args = parser.parse_args(_hoist_global_config(raw))
 
     try:
         config = load_config(args.config, require=args.config is not None)
@@ -116,6 +142,10 @@ def _cmd_run(router: Router, args: argparse.Namespace) -> int:
     if ticket.result_summary:
         print("result:")
         print(ticket.result_summary)
+    if ticket.artifacts:
+        print("artifacts:")
+        for artifact in ticket.artifacts:
+            print(f"  - {artifact}")
     if ticket.error:
         print(f"error:   {ticket.error}")
     return 0 if ticket.status is TicketStatus.DONE else 1
@@ -174,13 +204,21 @@ def _print_ticket(ticket: Ticket) -> None:
     print(f"timeout:      {ticket.timeout:g}s")
     print(f"created_at:   {ticket.created_at}")
     print(f"started_at:   {ticket.started_at or '-'}")
+    print(f"heartbeat_at: {ticket.heartbeat_at or '-'}")
     print(f"finished_at:  {ticket.finished_at or '-'}")
     print(f"exit_code:    {ticket.exit_code if ticket.exit_code is not None else '-'}")
+    print(f"attempts:     {ticket.attempts}")
     print(f"retry:        {ticket.retry_count}/{ticket.max_retries}")
     print(f"error:        {ticket.error or '-'}")
     print(f"log:          {ticket.log_path or '-'}")
     print("result:")
     print(ticket.result_summary or "(no result yet)")
+    print("artifacts:")
+    if ticket.artifacts:
+        for artifact in ticket.artifacts:
+            print(f"  - {artifact}")
+    else:
+        print("  (none)")
 
 
 def _ticket_dict(ticket: Ticket) -> dict[str, object]:
@@ -192,13 +230,16 @@ def _ticket_dict(ticket: Ticket) -> dict[str, object]:
         "workdir": ticket.workdir,
         "timeout": ticket.timeout,
         "result_summary": ticket.result_summary,
+        "artifacts": list(ticket.artifacts),
         "log_path": ticket.log_path,
         "error": ticket.error,
         "exit_code": ticket.exit_code,
+        "attempts": ticket.attempts,
         "retry_count": ticket.retry_count,
         "max_retries": ticket.max_retries,
         "created_at": ticket.created_at,
         "updated_at": ticket.updated_at,
         "started_at": ticket.started_at,
+        "heartbeat_at": ticket.heartbeat_at,
         "finished_at": ticket.finished_at,
     }

@@ -10,9 +10,15 @@ from .base import Worker, WorkerResult, append_log
 
 
 class EchoWorker(Worker):
-    """A fake worker that echoes the task without calling any model."""
+    """A fake worker that echoes the task without calling any external model.
+
+    It honours the same result contract as the Claude adapter by constructing
+    a successful :class:`WorkerResult` directly (``result_contract`` is off:
+    there is no model reply to parse, and ``success`` is authoritative).
+    """
 
     name = "echo"
+    result_contract = False
 
     def run(self, ticket: Ticket, workdir: Path) -> WorkerResult:
         started = time.monotonic()
@@ -32,4 +38,5 @@ class EchoWorker(Worker):
             output=output,
             exit_code=0,
             duration=time.monotonic() - started,
+            artifacts=[],
         )
