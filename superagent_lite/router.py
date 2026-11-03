@@ -6,7 +6,7 @@ import inspect
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from .config import default_config, normalize_config, resolve_claude_binary
 from .logs import append_log
@@ -44,8 +44,8 @@ class Router:
         recover_mode: str = "fail",
     ) -> None:
         self.config = normalize_config(dict(config)) if config is not None else default_config()
-        if recover_mode not in ("fail", "requeue"):
-            raise ValueError("recover_mode must be 'fail' or 'requeue'")
+        if recover_mode not in ("fail", "requeue", "none"):
+            raise ValueError("recover_mode must be 'fail', 'requeue' or 'none'")
         self.recover_mode = recover_mode
 
         self.runtime_dir = Path(self.config["runtime_dir"]).expanduser().resolve()
@@ -67,11 +67,21 @@ class Router:
         self.store = store
         # A crashed previous process may have left tickets "running".  The
         # synchronous CLI fails them (iteration 2 behaviour); the daemon puts
-        # them back on the queue so its pool re-executes them.
-        self.recovered = self.store.recover_stale_running(
-            stale_seconds=float(self.config["stale_seconds"]),
-            requeue=self.recover_mode == "requeue",
-        )
+        # them back on the queue so its pool re-executes them.  The Brain uses
+        # "none": it only submits and observes, and must not mutate tickets
+        # that a live daemon owns.
+        self.recovered: list[Ticket] = []
+        if self.recover_mode != "none":
+            self.recovered = self.store.recover_stale_running(
+                stale_seconds=float(self.config["stale_seconds"]),
+                requeue=self.recover_mode == "requeue",
+            )
+            # Recovery may have failed a ticket that others depend on (retry
+            # budget spent).  Those dependents can never run, so fail them now
+            # instead of leaving them pending forever.
+            for ticket in self.recovered:
+                if ticket.status is TicketStatus.FAILED:
+                    self.fail_dependents(ticket.id)
 
         claude_binary = resolve_claude_binary(self.config)
         default_workers: dict[str, Worker] = {
@@ -93,12 +103,24 @@ class Router:
         self.workers = default_workers
 
     # -- public API -----------------------------------------------------
-    def enqueue(self, text: str, worker: str | Worker | None = None) -> Ticket:
+    def enqueue(
+        self,
+        text: str,
+        worker: str | Worker | None = None,
+        *,
+        depends_on: Iterable[str] | None = None,
+        workdir: str | Path | None = None,
+    ) -> Ticket:
         """Create a ``pending`` ticket and return it immediately.
 
         The ticket is persisted for a daemon (or a later ``dispatch``) to
         claim; nothing is executed here.  This is what ``superagent queue``
         uses so the submitting side never waits for the run.
+
+        ``depends_on`` lists tickets that must be ``done`` first; the store
+        will not hand the ticket out before then.  ``workdir`` overrides the
+        default isolated directory, which is how the Brain points every
+        ticket of one request at the same user-specified directory.
         """
 
         description = (text or "").strip()
@@ -107,14 +129,19 @@ class Router:
 
         adapter = self._resolve_worker(worker)
         ticket_id = new_ticket_id()
+        dependencies = [str(item) for item in (depends_on or []) if str(item)]
         ticket = Ticket(
             id=ticket_id,
             description=description,
             worker=adapter.name,
             timeout=float(self.config["timeout_seconds"]),
-            workdir=str(self.work_dir / ticket_id),
+            workdir=str(
+                Path(workdir).expanduser().resolve() if workdir is not None
+                else self.work_dir / ticket_id
+            ),
             log_path=str(self.log_dir / f"{ticket_id}.log"),
             max_retries=int(self.config["max_retries"]),
+            depends_on=dependencies,
         )
 
         Path(ticket.workdir).mkdir(parents=True, exist_ok=True)
@@ -250,7 +277,33 @@ class Router:
             )
             + "\n",
         )
+        if updated.status is TicketStatus.FAILED:
+            self.fail_dependents(updated.id)
         return updated
+
+    def fail_dependents(self, ticket_id: str) -> list[Ticket]:
+        """Cascade a failure to every pending ticket that depends on it.
+
+        A dependency that failed can never be satisfied, so its dependents
+        are failed too (with an explicit reason) instead of sitting pending
+        forever.  Returns the tickets that were failed, transitively.
+        """
+
+        failed: list[Ticket] = []
+        frontier = [ticket_id]
+        while frontier:
+            current = frontier.pop(0)
+            for dependent in self.store.fail_dependents(
+                current, reason=f"dependency failed: {current}"
+            ):
+                append_log(
+                    dependent.log_path,
+                    f"[{utc_now()}] [router] failed because dependency {current} "
+                    f"failed\n",
+                )
+                failed.append(dependent)
+                frontier.append(dependent.id)
+        return failed
 
     def get(self, ticket_id: str) -> Ticket | None:
         """Return a ticket, or ``None`` when the id is unknown."""
@@ -343,9 +396,12 @@ class Router:
                 error=result.error or "worker failed",
             )
         else:
+            # No RESULT line to parse: the adapter's own verdict is
+            # authoritative, artifacts included (e.g. custom workers).
             outcome = ContractOutcome(
                 success=bool(result.success),
                 summary=result.summary,
+                artifacts=list(result.artifacts),
                 error=None if result.success else (result.error or "worker reported failure"),
             )
 
@@ -375,6 +431,7 @@ class Router:
                 ticket.log_path,
                 f"[{finished_at}] failed after {time.monotonic() - started:.2f}s: {error}\n",
             )
+            self.fail_dependents(ticket_id)
         except Exception:  # pragma: no cover - preserving the original failure wins
             pass
 

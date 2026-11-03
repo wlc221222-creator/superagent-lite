@@ -69,6 +69,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "daemon_watchdog_seconds": 5.0,
     "daemon_shutdown_grace_seconds": 30.0,
     "runtime_dir": "runtime",
+    # Brain (planner).  It speaks the Anthropic-compatible /v1/messages API;
+    # the base URL and token are read at request time from
+    # ``~/.claude/settings.json``'s ``env`` block (or the live environment).
+    # Only the model name lives here -- never a credential.
+    "brain_model": "cn:deepseek-v4.1-flash",
+    # Optional stronger planner model, used only when the planner flags the
+    # request as complex *and* this is set.  ``null`` keeps planning on the
+    # cheap default.
+    "brain_advanced_model": None,
+    # Only escalate to ``brain_advanced_model`` when the planner marks the
+    # request ``"complex": true``.  Off by default: expensive models are for
+    # planning only, and only when explicitly enabled.
+    "brain_escalate_on_complex": False,
+    "brain_max_tickets": 8,
+    "brain_settings_path": "~/.claude/settings.json",
+    "brain_max_tokens": 2048,
+    "brain_timeout_seconds": 120.0,
+    # Worker used for tickets whose worker the planner did not name.
+    "brain_worker": "claude",
+    "memory_path": "memory.md",
+    "brain_memory_max_chars": 2000,
+    # ``chat`` / ``POST /chat`` wait this long for tickets before replying
+    # with ticket ids instead of a summary.
+    "chat_timeout_seconds": 120.0,
+    "chat_poll_seconds": 0.25,
+    "http_host": "127.0.0.1",
+    "http_port": 8765,
 }
 
 _LIST_DEFAULTS = (
@@ -169,6 +196,56 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
 
     if not isinstance(config["runtime_dir"], (str, Path)) or not str(config["runtime_dir"]):
         raise ValueError("config.runtime_dir must be a non-empty path string")
+
+    for key in ("brain_model", "brain_worker", "brain_settings_path", "memory_path"):
+        if not isinstance(config[key], str) or not config[key].strip():
+            raise ValueError(f"config.{key} must be a non-empty string")
+    if config["brain_advanced_model"] is not None and (
+        not isinstance(config["brain_advanced_model"], str)
+        or not config["brain_advanced_model"].strip()
+    ):
+        raise ValueError("config.brain_advanced_model must be a non-empty string or null")
+    if isinstance(config["brain_max_tokens"], bool) or not isinstance(
+        config["brain_max_tokens"], int
+    ):
+        raise ValueError("config.brain_max_tokens must be an integer")
+    if config["brain_max_tokens"] <= 0:
+        raise ValueError("config.brain_max_tokens must be greater than 0")
+    if isinstance(config["brain_max_tickets"], bool) or not isinstance(
+        config["brain_max_tickets"], int
+    ):
+        raise ValueError("config.brain_max_tickets must be an integer")
+    if config["brain_max_tickets"] < 1:
+        raise ValueError("config.brain_max_tickets must be at least 1")
+    if not isinstance(config["brain_escalate_on_complex"], bool):
+        raise ValueError("config.brain_escalate_on_complex must be a boolean")
+
+    for key in (
+        "brain_timeout_seconds",
+        "chat_timeout_seconds",
+        "chat_poll_seconds",
+    ):
+        try:
+            number = float(config[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"config.{key} must be a number") from exc
+        if number <= 0:
+            raise ValueError(f"config.{key} must be greater than 0")
+        config[key] = number
+
+    if isinstance(config["brain_memory_max_chars"], bool) or not isinstance(
+        config["brain_memory_max_chars"], int
+    ):
+        raise ValueError("config.brain_memory_max_chars must be an integer")
+    if config["brain_memory_max_chars"] < 0:
+        raise ValueError("config.brain_memory_max_chars must be >= 0")
+
+    if isinstance(config["http_port"], bool) or not isinstance(config["http_port"], int):
+        raise ValueError("config.http_port must be an integer")
+    if not 0 <= config["http_port"] <= 65535:
+        raise ValueError("config.http_port must be between 0 and 65535")
+    if not isinstance(config["http_host"], str) or not config["http_host"].strip():
+        raise ValueError("config.http_host must be a non-empty string")
 
     return config
 

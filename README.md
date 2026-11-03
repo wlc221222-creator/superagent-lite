@@ -91,6 +91,108 @@ persisted in SQLite, so a restart loses nothing.
 A non-daemon `run`/`show`/`list` still recovers stale tickets, but it fails
 them (iteration 2 behaviour) rather than requeueing them.
 
+### The Brain: chat, planning and tickets (phase 3, milestone B)
+
+Users talk only to the main agent. `superagent chat` (CLI REPL) and
+`superagent serve` (HTTP) share one `Brain`, so both behave identically:
+
+```
+user sentence
+      │
+      ▼
+  Brain ──▶ planner model (/v1/messages, cheap model by default)
+      │
+      ├── "reply"  ─────────────────────────────▶ direct answer, no ticket
+      │
+      └── "plan"   ──▶ 1..N tickets (depends_on) ──▶ SQLite queue
+                                                       │
+                                             superagentd executes them
+                                                       │
+                        structured results ◀───────────┘
+                              │
+                              ▼
+                     summarize → one reply
+```
+
+- **Decomposition** -- the planner returns JSON: either
+  `{"action": "reply", "reply": "..."}` or
+  `{"action": "plan", "workdir": ..., "tickets": [{"id", "description",
+  "worker", "depends_on"}]}`. Ticket descriptions must stand alone because a
+  worker only sees its own description. All tickets of one request share a
+  working directory (the absolute path the user named, else a private
+  `runtime/work/brain_<stamp>/`), so later steps can use earlier output.
+- **Dependencies** -- `depends_on` is persisted and enforced by the store: a
+  ticket is only handed out once every prerequisite is `done`. A failed
+  prerequisite fails its dependents (transitively, from every path that writes
+  `failed`) instead of parking them forever. Independent tickets in a plan
+  still run in parallel.
+- **Waiting** -- `chat`/`POST /chat` poll the tickets for
+  `chat_timeout_seconds`; if they are not all terminal in time, the reply
+  lists the ticket ids (and their statuses) so the caller can ask again.
+- **Summary** -- the planner model receives the workers' *structured* results
+  (status, summary, artifacts, error as JSON) and writes the final answer. It
+  is told not to claim success the ticket data does not show; a failed ticket
+  is reported as failed.
+- **Memory** -- `memory.md` (path configurable) is injected into the planner
+  prompt, truncated to `brain_memory_max_chars` (default 2000, keeping the
+  beginning of the file). It is maintained by hand; nothing is auto-distilled.
+- **Errors** -- an unreachable/misconfigured planner comes back as
+  `mode: "error"` in the reply (HTTP 502) rather than crashing the REPL.
+
+#### Planner endpoint and credentials
+
+The planner calls an Anthropic-compatible `POST /v1/messages` over
+`urllib` -- standard library only. **No credential lives in this repo or in
+`config.json`.** At request time `superagent_lite/planner.py` reads the
+`env` block of `~/.claude/settings.json` (the same file Claude Code uses):
+
+```json
+{ "env": { "ANTHROPIC_BASE_URL": "https://gateway.example",
+           "ANTHROPIC_AUTH_TOKEN": "..." } }
+```
+
+and falls back to the live process environment when a key is absent there.
+`brain_settings_path` changes the file location. The token is only held in
+memory for the request; error messages are redacted so it cannot reach a log
+or a reply. Only the model name is configurable:
+
+| Key | Meaning |
+| --- | --- |
+| `brain_model` | Planner model (default `cn:deepseek-v4.1-flash`) |
+| `brain_advanced_model` | Optional stronger planner model; `null` = never escalate |
+| `brain_escalate_on_complex` | Allow escalation when the planner replies `"complex": true` (off by default) |
+| `brain_max_tickets` | Upper bound on tickets per plan (default 8) |
+| `brain_max_tokens` / `brain_timeout_seconds` | Planner request bounds |
+| `brain_worker` | Worker for tickets that do not name one (default `claude`) |
+| `brain_settings_path` | Where the endpoint/token are read from |
+| `memory_path` / `brain_memory_max_chars` | Memory file and its prompt budget |
+| `chat_timeout_seconds` / `chat_poll_seconds` | How long `/chat` waits, and how often it polls |
+| `http_host` / `http_port` | `serve` bind address (default `127.0.0.1:8765`) |
+
+#### HTTP API
+
+`python -m superagent_lite serve` (or `--host/--port`) starts
+`ThreadingHTTPServer`:
+
+| Request | Response |
+| --- | --- |
+| `POST /chat` `{"text": "...", "user_id": "..."}` | `{"reply", "mode", "ticket_ids", "timed_out", "model"}`; `mode` is `reply` / `summary` / `pending` (timeout) / `error` (502) |
+| `GET /tickets/<id>` | the ticket, including `status`, `artifacts`, `result_summary`, `depends_on` |
+| `GET /health` | liveness and queue counters (never authenticated) |
+
+When `SUPERAGENT_HTTP_TOKEN` is set, every endpoint except `/health` requires
+`Authorization: Bearer <token>` (or `X-SuperAgent-Token`); anything else is a
+401 before the body is read, comparisons use `hmac.compare_digest`. Unset, the
+server is open -- `serve` warns if that happens on a non-loopback address.
+
+```bash
+SUPERAGENT_HTTP_TOKEN=... python -m superagent_lite serve --port 8765
+curl -s localhost:8765/chat -H 'Authorization: Bearer ...' \
+     -H 'Content-Type: application/json' \
+     -d '{"text": "create /tmp/demo/hello.txt containing hi"}'
+curl -s localhost:8765/tickets/<id> -H 'Authorization: Bearer ...'
+```
+
 Guarantees, stated precisely: a ticket in a terminal state (`done` /
 `failed`) is never executed again, and a queued ticket is not lost. An
 **interrupted** run is retried, so a task that was half-way through when its
@@ -167,7 +269,12 @@ python -m unittest discover -s tests
 python tests/test_smoke.py
 python tests/test_contract.py
 python tests/test_daemon.py
+python tests/test_brain.py
 ```
+
+The Brain/HTTP tests never touch the network: they start a stub
+`/v1/messages` server (`tests/support.py::StubPlanner`) and point the Brain at
+it through a temporary settings file, exactly the path production uses.
 
 Everything lands under `runtime/` by default:
 
@@ -187,8 +294,23 @@ runtime/
 | `python -m superagent_lite run "<task>" --worker echo\|claude\|codex` | Create a ticket, execute it, print the summary |
 | `python -m superagent_lite queue "<task>" [--worker …] [--json]` | Create a `pending` ticket without executing it |
 | `python -m superagent_lite daemon [--concurrency N] [--poll S] [--max-retries N]` | Run superagentd in the foreground |
+| `python -m superagent_lite chat [--timeout S] [--model M] [--memory PATH] [--user-id ID]` | Talk to the main agent (REPL; pipes work too) |
+| `python -m superagent_lite serve [--host H] [--port P] [--timeout S]` | Run the minimal HTTP API |
 | `python -m superagent_lite list [--status done] [--limit 20] [--json]` | List tickets, newest first |
 | `python -m superagent_lite show <ticket_id> [--log] [--json]` | Show one ticket and its result |
+
+```bash
+# terminal 1: the queue
+python -m superagent_lite daemon
+# terminal 2: the main agent
+python -m superagent_lite chat
+you> 帮我在 /tmp/demo 建个 hello.txt 并写一行字
+agent> 已完成：创建了 /tmp/demo/hello.txt，内容为「你好」…
+```
+
+`chat` and `serve` use the configured worker (`brain_worker`, default
+`claude`) for execution; if the planner endpoint is unreachable the reply says
+so instead of the process dying.
 
 `python main.py ...` and the `superagent` console script (after
 `pip install -e .`) are equivalent entry points. All commands accept
@@ -218,9 +340,19 @@ See `config.example.json` for the full set; the essentials are:
   "daemon_poll_seconds": 0.5,
   "daemon_watchdog_seconds": 5,
   "daemon_shutdown_grace_seconds": 30,
-  "runtime_dir": "runtime"
+  "runtime_dir": "runtime",
+  "brain_model": "cn:deepseek-v4.1-flash",
+  "brain_worker": "claude",
+  "memory_path": "memory.md",
+  "chat_timeout_seconds": 120,
+  "http_host": "127.0.0.1",
+  "http_port": 8765
 }
 ```
+
+The planner's `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` deliberately do
+**not** appear here: they are read at runtime from `~/.claude/settings.json`
+(see above).
 
 | Key | Meaning |
 | --- | --- |
@@ -317,9 +449,13 @@ marks the ticket `failed`. Run `show <id> --log` to audit a run.
 ```
 superagent_lite/
 ├── models.py            # Ticket + TicketStatus
-├── store.py             # SQLite queue: atomic claim, leases, requeue, recovery
+├── store.py             # SQLite queue: atomic claim, leases, requeue, recovery, depends_on
 ├── router.py            # enqueue / dispatch / heartbeat / result judgement
 ├── daemon.py            # superagentd: pool, watchdog, graceful shutdown
+├── brain.py             # planner: reply-or-decompose, enqueue, wait, summarize
+├── planner.py           # /v1/messages client; endpoint read from ~/.claude/settings.json
+├── memory.py            # memory.md loading + truncation
+├── http_api.py          # POST /chat, GET /tickets/<id>, static-token auth
 ├── result.py            # RESULT contract: prompt, parsing, verdict
 ├── redact.py            # secret redaction for logs
 ├── logs.py              # redacting log writer
@@ -334,23 +470,25 @@ tests/
 ├── test_smoke.py        # create → execute → complete → query
 ├── test_contract.py     # contract, boundary, discovery, heartbeat tests
 ├── test_daemon.py       # queue → daemon → done, restart, pool, shutdown
-└── support.py           # stub claude CLI used by the tests
+├── test_brain.py        # planner stub, chat, HTTP API, memory, depends_on
+└── support.py           # stub claude CLI + stub /v1/messages planner
 config.example.json
+memory.md                # hand-maintained planner memory (template)
 main.py                  # equivalent entry point
 ```
 
 ## Roadmap
 
 - **Codex adapter** — implement `CodexWorker.run` against the Codex CLI.
-- **HTTP API** — expose `submit` / `list` / `result` as a small service.
-- **Messaging channels** — receive tasks and reply through chat platforms.
-- **Brain / planner** — phase 3 milestone B: split a request into tickets
-  with `depends_on`, then aggregate the results.
+- **Messaging channels** — receive tasks and reply through chat platforms
+  (on top of the token-authenticated HTTP API).
+- **Web UI** — a browser front end for the same `/chat` endpoint.
+- **Automatic memory distillation** — write `memory.md` from finished chats.
 - **Multi-daemon** — claims and leases are already atomic; a coordinator or
   a shared watchdog would let several hosts drain one queue.
 - **License** — TBD (to be chosen before open-sourcing).
 
-## Out of scope for the MVP
+## Out of scope for phase 3
 
-Web UI, HTTP server, multi-user permissions, chat integrations, and the
-planning brain (milestone B).
+Web UI, multi-user permissions and per-user isolation, automatic memory
+distillation, and DAG-aware scheduling beyond `depends_on` gating.

@@ -63,6 +63,10 @@ class Ticket:
     timeout: float = 300.0
     result_summary: str | None = None
     artifacts: list[str] = field(default_factory=list)
+    # Ticket ids that must reach ``done`` before this ticket may be claimed.
+    # The planner (Brain) sets these when it decomposes a request; the store
+    # refuses to hand out a ticket whose dependencies are not satisfied.
+    depends_on: list[str] = field(default_factory=list)
     log_path: str | None = None
     error: str | None = None
     exit_code: int | None = None

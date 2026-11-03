@@ -139,3 +139,149 @@ def wait_for(predicate, timeout: float = 10.0, interval: float = 0.02):
             return value
         _time.sleep(interval)
     raise AssertionError(f"condition not met within {timeout:g}s: {predicate}")
+
+
+# ---------------------------------------------------------------------------
+# Stub Anthropic-compatible planner endpoint
+# ---------------------------------------------------------------------------
+class StubPlanner:
+    """A local ``/v1/messages`` server the Brain can be pointed at.
+
+    No network, no credentials: the Brain resolves the endpoint from a
+    ``settings.json`` written by :meth:`settings_file`, exactly like it does
+    with ``~/.claude/settings.json`` in production.
+
+    ``responder(payload, index)`` returns the assistant text, or raises to
+    simulate a model-side crash.  Requests are recorded (headers + JSON body)
+    for assertions.
+    """
+
+    def __init__(self, *, token: str = "test-planner-token", responder=None) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        def _authorized(headers, token: str) -> bool:
+            supplied = headers.get("Authorization") or headers.get("X-Api-Key") or ""
+            if supplied.lower().startswith("bearer "):
+                supplied = supplied[7:]
+            return supplied.strip() == token
+
+        stub = self
+        self.token = token
+        self.requests: list[dict] = []
+        self.responder = responder or (
+            lambda payload, index: '{"action": "reply", "reply": "ok"}'
+        )
+        self._lock = threading.Lock()
+        self.status = 200
+        self.error_body = ""
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                import json as _json
+
+                if self.path != "/v1/messages":
+                    self.send_error(404)
+                    return
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length)
+                try:
+                    payload = _json.loads(body.decode("utf-8"))
+                except Exception:
+                    payload = {"unparsed": body.decode("utf-8", "replace")}
+                with stub._lock:
+                    index = len(stub.requests)
+                    stub.requests.append(
+                        {
+                            "headers": {k.lower(): v for k, v in self.headers.items()},
+                            "payload": payload,
+                        }
+                    )
+                    status = stub.status
+                    error_body = stub.error_body
+                if stub.token and not _authorized(self.headers, stub.token):
+                    self._respond(401, _json.dumps({"error": "unauthorized"}))
+                    return
+                if status != 200:
+                    self._respond(status, error_body or '{"error": "stub failure"}')
+                    return
+                text = stub.responder(payload, index)
+                answer = _json.dumps(
+                    {
+                        "id": f"msg_{index}",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": payload.get("model", "stub"),
+                        "content": [
+                            {"type": "thinking", "thinking": "internal reasoning"},
+                            {"type": "text", "text": text},
+                        ],
+                        "stop_reason": "end_turn",
+                    }
+                )
+                self._respond(200, answer)
+
+            def _respond(self, code: int, text: str) -> None:
+                raw = text.encode("utf-8")
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, fmt: str, *args) -> None:  # noqa: A002
+                pass
+
+        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._httpd.daemon_threads = True
+        self._thread = threading.Thread(
+            target=self._httpd.serve_forever, name="stub-planner", daemon=True
+        )
+
+    # -- lifecycle ------------------------------------------------------
+    @property
+    def base_url(self) -> str:
+        host, port = self._httpd.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def start(self) -> "StubPlanner":
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._httpd.shutdown()
+        self._httpd.server_close()
+        self._thread.join(timeout=5)
+
+    def __enter__(self) -> "StubPlanner":
+        return self.start()
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.stop()
+
+    # -- helpers --------------------------------------------------------
+    def settings_file(self, path: str | Path) -> Path:
+        """Write a Claude-Code-shaped settings file pointing at this stub."""
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "env": {
+                        "ANTHROPIC_BASE_URL": self.base_url,
+                        "ANTHROPIC_AUTH_TOKEN": self.token,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def payloads(self) -> list[dict]:
+        with self._lock:
+            return [entry["payload"] for entry in self.requests]
+
+    def headers(self) -> list[dict]:
+        with self._lock:
+            return [entry["headers"] for entry in self.requests]

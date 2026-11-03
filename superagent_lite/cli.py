@@ -9,13 +9,15 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
+from .brain import Brain
 from .config import load_config
 from .daemon import Daemon, DaemonAlreadyRunning
+from .http_api import ApiConfig, make_server, token_from_env
 from .models import Ticket, TicketStatus
 from .router import Router
 
 STATUS_CHOICES = [status.value for status in TicketStatus]
-COMMANDS = ("run", "queue", "daemon", "list", "show")
+COMMANDS = ("run", "queue", "daemon", "list", "show", "chat", "serve")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -116,6 +118,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="print machine-readable JSON"
     )
 
+    chat = subparsers.add_parser(
+        "chat",
+        parents=[common],
+        help="talk to the main agent (REPL); tickets run on superagentd",
+    )
+    chat.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="seconds to wait for tickets before printing ticket ids "
+        "(default: config.chat_timeout_seconds)",
+    )
+    chat.add_argument(
+        "--model",
+        default=None,
+        help="planner model (default: config.brain_model)",
+    )
+    chat.add_argument(
+        "--memory",
+        default=None,
+        metavar="PATH",
+        help="memory file injected into the planner prompt (default: config.memory_path)",
+    )
+    chat.add_argument(
+        "--user-id", default="cli", help="user id shown to the planner (default: cli)"
+    )
+
+    serve = subparsers.add_parser(
+        "serve",
+        parents=[common],
+        help="run the minimal HTTP API (POST /chat, GET /tickets/<id>)",
+    )
+    serve.add_argument("--host", default=None, help="bind host (default: config.http_host)")
+    serve.add_argument("--port", type=int, default=None, help="bind port (default: config.http_port)")
+    serve.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="seconds /chat waits for tickets (default: config.chat_timeout_seconds)",
+    )
+    serve.add_argument("--model", default=None, help="planner model override")
+    serve.add_argument("--memory", default=None, metavar="PATH", help="memory file path")
+
     return parser
 
 
@@ -161,6 +206,16 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command in ("run", "queue") and args.timeout is not None:
         config["timeout_seconds"] = args.timeout
+    if args.command in ("chat", "serve"):
+        if args.timeout is not None:
+            if args.timeout <= 0:
+                print("error: --timeout must be greater than 0", file=sys.stderr)
+                return 2
+            config["chat_timeout_seconds"] = args.timeout
+        if args.model:
+            config["brain_model"] = args.model
+        if args.memory:
+            config["memory_path"] = args.memory
 
     if args.command == "daemon":
         if args.concurrency is not None and args.concurrency < 1:
@@ -187,6 +242,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
+    if args.command == "chat":
+        return _cmd_chat(config, args)
+    if args.command == "serve":
+        return _cmd_serve(config, args)
+
     try:
         with Router(config=config) as router:
             if args.command == "run":
@@ -203,6 +263,94 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     parser.error(f"unknown command: {args.command}")
     return 2  # pragma: no cover - argparse exits first
+
+
+CHAT_BANNER = """\
+superagent chat -- talk to the main agent. Tickets run on superagentd.
+  /help      show this help          /tickets   list recent tickets
+  /quit      leave (also Ctrl-D)     (everything else is a message)
+"""
+
+
+def _cmd_chat(config: dict, args: argparse.Namespace) -> int:
+    """Local REPL. Input is read line by line so it also works in a pipe."""
+
+    with Brain(config=config) as brain:
+        interactive = sys.stdin.isatty()
+        if interactive:
+            print(CHAT_BANNER)
+            print(f"planner model: {config['brain_model']}")
+        while True:
+            try:
+                if interactive:
+                    line = input("you> ")
+                else:
+                    line = sys.stdin.readline()
+                    if not line:
+                        break
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+
+            text = line.strip()
+            if not text:
+                continue
+            if text in ("/quit", "/exit", ":q"):
+                break
+            if text in ("/help", "/?"):
+                print(CHAT_BANNER)
+                continue
+            if text == "/tickets":
+                _cmd_list(brain.router, argparse.Namespace(status=None, limit=10, json=False))
+                continue
+
+            reply = brain.reply(text, user_id=args.user_id)
+            if interactive:
+                print(f"\nagent> {reply.text}\n")
+            else:
+                # Machine-friendly one-shot: the reply text, then a status
+                # line on stderr so stdout stays clean for scripting.
+                print(reply.text)
+                print(
+                    f"[mode={reply.mode}"
+                    + (f" tickets={','.join(reply.ticket_ids)}" if reply.ticket_ids else "")
+                    + "]",
+                    file=sys.stderr,
+                )
+    return 0
+
+
+def _cmd_serve(config: dict, args: argparse.Namespace) -> int:
+    """Run the HTTP API in the foreground."""
+
+    host = args.host or config["http_host"]
+    port = config["http_port"] if args.port is None else args.port
+    if not 0 <= int(port) <= 65535:
+        print("error: --port must be between 0 and 65535", file=sys.stderr)
+        return 2
+    token = token_from_env()
+    if not token and host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            "warning: serving on a non-loopback address without "
+            "SUPERAGENT_HTTP_TOKEN; anyone who can reach this port can run "
+            "tasks on this machine",
+            file=sys.stderr,
+        )
+
+    api = ApiConfig(host=host, port=int(port), token=token)
+    with Brain(config=config) as brain:
+        server = make_server(brain, api)
+        actual_host, actual_port = server.server_address[:2]
+        print(f"superagent http api on http://{actual_host}:{actual_port}")
+        print(f"auth: {'static token' if token else 'open (no SUPERAGENT_HTTP_TOKEN)'}")
+        print(f"planner model: {config['brain_model']}")
+        try:
+            server.serve_forever(poll_interval=0.2)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            server.server_close()
+    return 0
 
 
 def _cmd_run(router: Router, args: argparse.Namespace) -> int:
@@ -300,6 +448,7 @@ def _print_ticket(ticket: Ticket) -> None:
     print(f"status:       {ticket.status.value}")
     print(f"worker:       {ticket.worker}")
     print(f"workdir:      {ticket.workdir}")
+    print(f"depends_on:   {', '.join(ticket.depends_on) or '-'}")
     print(f"timeout:      {ticket.timeout:g}s")
     print(f"created_at:   {ticket.created_at}")
     print(f"started_at:   {ticket.started_at or '-'}")
@@ -330,6 +479,7 @@ def _ticket_dict(ticket: Ticket) -> dict[str, object]:
         "timeout": ticket.timeout,
         "result_summary": ticket.result_summary,
         "artifacts": list(ticket.artifacts),
+        "depends_on": list(ticket.depends_on),
         "log_path": ticket.log_path,
         "error": ticket.error,
         "exit_code": ticket.exit_code,

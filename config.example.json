@@ -36,5 +36,19 @@
   "daemon_poll_seconds": 0.5,
   "daemon_watchdog_seconds": 5,
   "daemon_shutdown_grace_seconds": 30,
-  "runtime_dir": "runtime"
+  "runtime_dir": "runtime",
+  "brain_model": "cn:deepseek-v4.1-flash",
+  "brain_advanced_model": null,
+  "brain_escalate_on_complex": false,
+  "brain_max_tickets": 8,
+  "brain_settings_path": "~/.claude/settings.json",
+  "brain_max_tokens": 2048,
+  "brain_timeout_seconds": 120,
+  "brain_worker": "claude",
+  "memory_path": "memory.md",
+  "brain_memory_max_chars": 2000,
+  "chat_timeout_seconds": 120,
+  "chat_poll_seconds": 0.25,
+  "http_host": "127.0.0.1",
+  "http_port": 8765
 }

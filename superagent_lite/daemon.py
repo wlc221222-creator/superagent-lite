@@ -278,6 +278,7 @@ class Daemon:
             except Exception:  # pragma: no cover - store is the last resort
                 pass
             status = f"crashed ({type(exc).__name__}: {exc})"
+            self._cascade_failures(ticket.id)
         finally:
             with self._condition:
                 self._active.pop(ticket.id, None)
@@ -319,7 +320,28 @@ class Daemon:
                 f"watchdog recovered {ticket.id}: status={ticket.status.value} "
                 f"retry={ticket.retry_count}/{ticket.max_retries}"
             )
+            if ticket.status is TicketStatus.FAILED:
+                self._cascade_failures(ticket.id)
         return recovered
+
+    def _cascade_failures(self, ticket_id: str) -> None:
+        """Fail dependents of a ticket the pool/watchdog gave up on.
+
+        ``Router.run_claimed`` already does this for ordinary worker
+        failures; this covers the paths that write ``failed`` directly (a
+        crashed pool thread, or a watchdog requeue that exhausted the retry
+        budget).  Without it, dependents would sit ``pending`` forever.
+        """
+
+        if self.router is None:
+            return
+        try:
+            failed = self.router.fail_dependents(ticket_id)
+        except Exception as exc:  # pragma: no cover - never kill the pool
+            self._log(f"dependency cascade failed for {ticket_id}: {exc}")
+            return
+        for ticket in failed:
+            self._log(f"failed dependent {ticket.id} of {ticket_id}")
 
     def _recover_orphans(self) -> None:
         """Requeue everything left ``running`` by a previous daemon.
@@ -339,6 +361,8 @@ class Daemon:
                 f"recovered orphan {ticket.id}: status={ticket.status.value} "
                 f"retry={ticket.retry_count}/{ticket.max_retries}"
             )
+            if ticket.status is TicketStatus.FAILED:
+                self._cascade_failures(ticket.id)
 
     # -- shutdown -------------------------------------------------------
     def _shutdown(self) -> None:

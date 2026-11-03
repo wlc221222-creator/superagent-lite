@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     timeout        REAL NOT NULL,
     result_summary TEXT,
     artifacts      TEXT,
+    depends_on     TEXT,
     log_path       TEXT,
     error          TEXT,
     exit_code      INTEGER,
@@ -48,6 +49,7 @@ FIELDS: tuple[str, ...] = (
     "timeout",
     "result_summary",
     "artifacts",
+    "depends_on",
     "log_path",
     "error",
     "exit_code",
@@ -65,6 +67,7 @@ FIELDS: tuple[str, ...] = (
 # Columns added after the first MVP schema; existing databases are migrated.
 _ADDED_COLUMNS: dict[str, str] = {
     "artifacts": "TEXT",
+    "depends_on": "TEXT",
     "attempts": "INTEGER NOT NULL DEFAULT 0",
     "heartbeat_at": "TEXT",
     "claim_token": "TEXT",
@@ -213,12 +216,20 @@ class TicketStore:
 
         Returns the freshly claimed (running) ticket, or ``None`` when the
         ticket is not pending any more -- for example because a daemon won
-        the race.
+        the race.  A ticket whose ``depends_on`` prerequisites are not all
+        ``done`` is never claimed.
         """
 
         now = utc_now()
         token = secrets.token_hex(8)
         with self._lock:
+            pending = self.get(ticket_id)
+            if (
+                pending is None
+                or pending.status is not TicketStatus.PENDING
+                or not self._dependencies_done(pending.depends_on)
+            ):
+                return None
             cursor = self._conn.execute(
                 "UPDATE tickets SET status = ?, started_at = ?, heartbeat_at = ?, "
                 "updated_at = ?, claim_token = ?, attempts = attempts + 1, "
@@ -266,16 +277,20 @@ class TicketStore:
             return None
         now = utc_now()
         with self._lock:
-            query = "SELECT id FROM tickets WHERE status = ?"
+            query = "SELECT id, depends_on FROM tickets WHERE status = ?"
             params: list[object] = [TicketStatus.PENDING.value]
             if names is not None:
                 query += f" AND worker IN ({', '.join('?' for _ in names)})"
                 params.extend(names)
-            query += " ORDER BY created_at ASC, rowid ASC LIMIT 1"
-            row = self._conn.execute(query, params).fetchone()
-            if row is None:
+            query += " ORDER BY created_at ASC, rowid ASC"
+            rows = self._conn.execute(query, params).fetchall()
+            ticket_id: str | None = None
+            for row in rows:
+                if self._dependencies_done(self._parse_dependencies(row["depends_on"])):
+                    ticket_id = row["id"]
+                    break
+            if ticket_id is None:
                 return None
-            ticket_id = row["id"]
             token = secrets.token_hex(8)
             cursor = self._conn.execute(
                 "UPDATE tickets SET status = ?, started_at = ?, heartbeat_at = ?, "
@@ -303,6 +318,38 @@ class TicketStore:
                 )
             self._conn.commit()
         return self.get(ticket_id)
+
+    def fail_dependents(
+        self, ticket_id: str, *, reason: str | None = None
+    ) -> list[Ticket]:
+        """Fail every pending ticket that depends on the failed ``ticket_id``.
+
+        A dependency that ends ``failed`` can never be satisfied, so leaving
+        its dependents ``pending`` forever would silently park work.  Only
+        ``pending`` tickets are touched: one that is already running (it was
+        claimed while the dependency looked done) is left to its own result.
+        The cascade is one level deep; callers may invoke it again for each
+        newly failed ticket.
+        """
+
+        message = reason or f"dependency failed: {ticket_id}"
+        failed: list[Ticket] = []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, depends_on FROM tickets WHERE status = ?",
+                (TicketStatus.PENDING.value,),
+            ).fetchall()
+            for row in rows:
+                if ticket_id not in self._parse_dependencies(row["depends_on"]):
+                    continue
+                updated = self.set_status(
+                    row["id"],
+                    TicketStatus.FAILED,
+                    error=message,
+                    finished_at=utc_now(),
+                )
+                failed.append(updated)
+        return failed
 
     def heartbeat(
         self, ticket_id: str, *, claim_token: object = _UNSET
@@ -440,6 +487,34 @@ class TicketStore:
         return recovered
 
     # -- reads ----------------------------------------------------------
+    def _parse_dependencies(self, raw: object) -> list[str]:
+        """Decode a ``depends_on`` column.
+
+        A row written by an older build has no ``depends_on`` column value
+        (the migrated column is NULL), which decodes to "no dependencies".
+        """
+
+        try:
+            return _string_list(raw)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return []
+
+    def _dependencies_done(self, ticket_ids: list[str]) -> bool:
+        """True when every id in ``ticket_ids`` exists and is ``done``.
+
+        Unknown ids count as unsatisfied: a dependency on a ticket that was
+        never created can only be a planning mistake, and the ticket must not
+        run on an assumption the planner got wrong.
+        """
+
+        for dependency in ticket_ids:
+            row = self._conn.execute(
+                "SELECT status FROM tickets WHERE id = ?", (dependency,)
+            ).fetchone()
+            if row is None or row["status"] != TicketStatus.DONE.value:
+                return False
+        return True
+
     def get(self, ticket_id: str) -> Ticket | None:
         with self._lock:
             row = self._conn.execute(
@@ -500,6 +575,20 @@ def _value(value: object) -> object:
     return value
 
 
+def _string_list(raw: object) -> list[str]:
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        return [str(item) for item in raw]
+    try:
+        parsed = json.loads(str(raw))
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(item) for item in parsed]
+
+
 def _artifacts(raw: object) -> list[str]:
     if not raw:
         return []
@@ -546,6 +635,7 @@ def _from_row(row: sqlite3.Row) -> Ticket:
         timeout=float(row["timeout"]),
         result_summary=row["result_summary"],
         artifacts=_artifacts(row["artifacts"]),
+        depends_on=_string_list(row["depends_on"]),
         log_path=row["log_path"],
         error=row["error"],
         exit_code=row["exit_code"],
