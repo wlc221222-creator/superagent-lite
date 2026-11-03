@@ -6,7 +6,13 @@ every other client:
 
 * ``POST /chat`` with the message;
 * ``GET  /tickets/<id>`` to poll progress after a ticket was queued;
+* ``GET  /attention`` for the read-only "needs attention" list (tickets
+  awaiting approval and tickets whose semantic review was inconclusive);
 * the artifact endpoints to list and download what a worker produced.
+
+The attention list is display-only: approving a gated ticket stays on the
+CLI (``approve <id>``) and the HTTP control path
+(``POST /tickets/<id>/approve``), not in this page.
 
 The token is kept in ``sessionStorage`` only, never in the URL, so it does not
 leak through history, referrers or proxy logs.  The page itself is public --
@@ -78,6 +84,14 @@ CHAT_PAGE = """<!doctype html>
   .artifacts a { color: var(--accent); margin-right: 12px; cursor: pointer;
                  text-decoration: underline; font-size: 13px; }
   .error { color: var(--bad); }
+  .state-awaiting_approval { color: #b26a00; font-weight: 600; }
+  .attention { margin: 4px 16px 0; padding: 10px 12px; border: 1px dashed var(--line);
+               border-radius: 10px; background: var(--panel); font-size: 13px; }
+  .attention h2 { font-size: 13px; margin: 0 0 6px; color: var(--muted); font-weight: 600; }
+  .attention .row { padding: 3px 0; }
+  .attention .tag { display: inline-block; min-width: 116px; color: var(--muted); }
+  .attention .id { font-family: ui-monospace, Menlo, Consolas, monospace; }
+  .attention .how { color: var(--muted); margin-top: 6px; }
   footer { padding: 10px 16px 20px; }
   .composer { display: flex; gap: 8px; align-items: flex-end; }
   textarea {
@@ -97,6 +111,12 @@ CHAT_PAGE = """<!doctype html>
       <button id="save-token" class="secondary" type="button">保存</button>
     </div>
   </header>
+  <section id="attention" class="attention" hidden>
+    <h2>需要关注 / needs attention（只读）</h2>
+    <div id="attention-rows"></div>
+    <div class="how">审批请用 CLI <code>approve &lt;id&gt;</code> /
+      <code>reject &lt;id&gt;</code> 或 API <code>POST /tickets/&lt;id&gt;/approve</code>。</div>
+  </section>
   <main id="log">
     <div class="msg">
       <div class="meta">agent</div>
@@ -171,12 +191,43 @@ CHAT_PAGE = """<!doctype html>
   }
 
   function terminal(status) {
-    return status === "done" || status === "failed";
+    return status === "done" || status === "failed"
+      || status === "awaiting_approval";
+  }
+
+  function refreshAttention() {
+    var box = document.getElementById("attention");
+    var rows = document.getElementById("attention-rows");
+    if (!tokenEl.value.trim()) { box.hidden = true; return; }
+    api("/attention").then(function (data) {
+      var items = (data && data.tickets) || [];
+      rows.textContent = "";
+      box.hidden = items.length === 0;
+      items.forEach(function (item) {
+        var row = document.createElement("div");
+        row.className = "row";
+        var tag = document.createElement("span");
+        tag.className = "tag";
+        tag.textContent = item.reason === "awaiting_approval"
+          ? "待审批" : "审查未定论";
+        var id = document.createElement("span");
+        id.className = "id";
+        id.textContent = item.id;
+        var desc = document.createElement("span");
+        desc.textContent = "  " + String(item.description || "").split(String.fromCharCode(10))[0].slice(0, 90);
+        row.appendChild(tag);
+        row.appendChild(id);
+        row.appendChild(desc);
+        rows.appendChild(row);
+      });
+    }).catch(function () { box.hidden = true; });
   }
 
   function renderProgress(el, ticket, index) {
     var state = ticket.status || "unknown";
-    var cls = state === "done" ? " state-done" : (state === "failed" ? " state-failed" : "");
+    var cls = state === "done" ? " state-done"
+      : (state === "failed" ? " state-failed"
+      : (state === "awaiting_approval" ? " state-awaiting_approval" : ""));
     var line = document.createElement("div");
     line.className = "row";
     var name = document.createElement("span");
@@ -198,6 +249,23 @@ CHAT_PAGE = """<!doctype html>
       error.className = "error";
       error.textContent = ticket.error;
       el.appendChild(error);
+    }
+    if (ticket.review_status && ticket.review_status !== "none") {
+      var review = document.createElement("div");
+      review.textContent = "审查 review: " + ticket.review_status
+        + ((ticket.review_reasons || []).length
+           ? " — " + ticket.review_reasons.join("; ") : "");
+      if (ticket.review_status === "rejected"
+          || ticket.review_status === "inconclusive") {
+        review.className = "error";
+      }
+      el.appendChild(review);
+    }
+    if (state === "awaiting_approval") {
+      var wait = document.createElement("div");
+      wait.textContent = "等待审批：用 CLI approve " + ticket.id
+        + " 或 POST /tickets/" + ticket.id + "/approve。";
+      el.appendChild(wait);
     }
     var artifacts = ticket.artifacts || [];
     if (artifacts.length) {
@@ -312,6 +380,7 @@ CHAT_PAGE = """<!doctype html>
     }).then(function () {
       setBusy(false);
       messageEl.focus();
+      refreshAttention();
     });
   }
 
@@ -321,6 +390,7 @@ CHAT_PAGE = """<!doctype html>
     this.textContent = "已保存";
     var button = this;
     setTimeout(function () { button.textContent = "保存"; }, 1200);
+    refreshAttention();
   });
   messageEl.addEventListener("keydown", function (event) {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -329,6 +399,7 @@ CHAT_PAGE = """<!doctype html>
     }
   });
   messageEl.focus();
+  refreshAttention();
 })();
 </script>
 </body>

@@ -1,0 +1,8 @@
+{
+  "description": "Write squares.py that prints the squares of the integers 1..10 inclusive, one per line.",
+  "artifacts": {
+    "squares.py": "for i in range(1, 10):\n    print(i * i)\n"
+  },
+  "expected": "reject",
+  "note": "Subtle off-by-one: range(1, 10) stops at 9, not 10."
+}

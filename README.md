@@ -657,3 +657,53 @@ distillation, and DAG-aware scheduling beyond `depends_on` gating.
 Multi-user login/sessions in the web UI, encrypted Feishu callbacks, other
 messaging channels, artifact previews, and containerised deployment (the
 units assume a plain host install).
+
+## Phase 5: semantic review, approval gate, decision log
+
+Phase 5 adds a governance layer on top of the contract acceptance from
+earlier phases. Everything is off or passive by default; nothing changes
+unless you configure it.
+
+**Semantic review.** After a ticket passes contract acceptance, a reviewer
+model can check the actual artifacts against the ticket description (the
+acceptance standard). The reviewer sees only the description, contract
+facts, and the artifact contents (delimited as data, redacted for common
+secret patterns first) — never the worker's own summary. Every non-`echo`
+ticket is reviewed when review is on. A `reject` verdict sends the ticket
+back once with the reviewer's reasons appended; a second reject fails it.
+Review runs in three modes (`review_mode`): `off`, `shadow` (verdicts are
+computed and logged, never block), and `enforce`. Roll out in shadow first.
+Note that review sends artifact content to the configured model provider.
+
+Key config: `review_mode` (default `off`), `review_model` (no default;
+review stays off without one — pick a different model from the planner's),
+`review_timeout_seconds` (default 60, must stay below `stale_seconds`).
+
+**Approval gate.** Tickets whose description matches deterministic
+patterns for irreversible or external actions (delete, publish, send,
+pay, `git push`, …) start in `awaiting_approval` and are never claimed by
+the daemon. Approve or reject them with `superagent-lite approve <id>` /
+`reject <id>` or `POST /tickets/<id>/approve|reject`. Approval is bound to
+the ticket's content: if the description changes after gating, the old
+approval does not apply. This gate is a confirmation/reminder layer, not
+a security boundary — an approved ticket's worker still runs with its
+normal tool allowlist.
+
+**Decision log.** `<runtime_dir>/decisions.jsonl` is an append-only JSONL
+record of ticket creation, approval events, review verdicts, and final
+outcomes, with a simple hash link between consecutive records. It exists
+so decisions can be reviewed after the fact; write failures are counted
+and logged, never block ticket processing.
+
+**Review eval corpus.** `tests/fixtures/review_corpus/` holds labelled
+cases (clean, defective, and prompt-injection cases). Grade candidate
+reviewer models offline before trusting one:
+
+```bash
+python3 tools/run_review_eval.py --models <model-a> <model-b>
+```
+
+Ground truth in the corpus is fixed by construction — labels are written
+when the cases are authored, never from a model's output. Grow the corpus
+from real tickets during shadow operation, especially any case a reviewer
+got wrong.

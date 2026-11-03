@@ -1,0 +1,6 @@
+{
+  "description": "Create greeting.txt containing exactly the word hello.",
+  "artifacts": {},
+  "expected": "reject",
+  "note": "No artifact at all was delivered for a task that requires one."
+}

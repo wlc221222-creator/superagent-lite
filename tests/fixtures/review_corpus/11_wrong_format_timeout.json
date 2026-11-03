@@ -1,0 +1,8 @@
+{
+  "description": "Write timeout.py exposing DEFAULT_TIMEOUT = 30 as a module constant.",
+  "artifacts": {
+    "timeout.py": "default_timeout = 30\n# TODO: rename to DEFAULT_TIMEOUT\n"
+  },
+  "expected": "reject",
+  "note": "Wrong-content pass-check: similar but the required constant name/format is absent."
+}

@@ -190,7 +190,7 @@ class Brain:
         ids = [ticket.id for ticket in tickets]
 
         if timed_out:
-            pending = [t.id for t in finished if not t.is_terminal]
+            pending = [t.id for t in finished if not _settled(t)]
             state = ", ".join(
                 f"{t.id}={t.status.value}" for t in finished
             )
@@ -206,6 +206,7 @@ class Brain:
                 timed_out=True,
             )
 
+        waiting = [t for t in finished if t.awaits_approval]
         try:
             summary = self.summarize(text, finished)
         except PlannerError as exc:
@@ -213,6 +214,19 @@ class Brain:
                 "All tickets finished, but summarizing the results failed: "
                 f"{exc}\n\n"
                 + "\n".join(_describe_ticket(t) for t in finished)
+            )
+        if waiting:
+            # The planner's summary comes from a model and may not know about
+            # gating; state the operational fact ourselves, deterministically:
+            # this ticket has not run and waits for an operator.
+            summary += "\n\n" + "\n".join(
+                _approval_notice(t) for t in waiting
+            )
+            return ChatReply(
+                text=summary,
+                mode=MODE_PENDING,
+                ticket_ids=ids,
+                timed_out=False,
             )
         return ChatReply(
             text=summary,
@@ -287,13 +301,19 @@ class Brain:
                 worker=worker or default_worker,
                 depends_on=dependencies,
                 workdir=workdir,
+                origin="plan",
             )
             step_to_ticket[step.id] = ticket.id
             tickets.append(ticket)
         return tickets
 
     def wait(self, tickets: Sequence[Ticket], *, timeout: float) -> tuple[list[Ticket], bool]:
-        """Poll until every ticket is terminal or ``timeout`` expires."""
+        """Poll until every ticket is settled for this reply or ``timeout`` expires.
+
+        ``awaiting_approval`` is terminal-for-this-reply (Revision 2 / phase 5
+        §2): the ticket waits for an operator, so the chat must answer now
+        saying so instead of polling until the deadline.
+        """
 
         deadline = time.monotonic() + max(0.0, float(timeout))
         interval = max(0.01, float(self.config["chat_poll_seconds"]))
@@ -301,7 +321,7 @@ class Brain:
             current = [
                 self.router.get(ticket.id) or ticket for ticket in tickets
             ]
-            if all(ticket.is_terminal for ticket in current):
+            if all(_settled(ticket) for ticket in current):
                 return current, False
             if time.monotonic() >= deadline:
                 return current, True
@@ -323,8 +343,10 @@ class Brain:
             "agents have finished the tickets below. Write the final answer "
             "to the user: what was actually done, which artifacts were "
             "created, and any failure honestly. Do not invent results, "
-            "files or success that the ticket data does not show. Be "
-            "concise and answer in the language of the request."
+            "files or success that the ticket data does not show. A ticket "
+            "whose review_status is rejected or inconclusive must be "
+            "reported as such, quoting review_reasons when they are present. "
+            "Be concise and answer in the language of the request."
         )
         return self._complete(
             model=str(self.config["brain_model"]),
@@ -605,22 +627,46 @@ def _absolute_or_none(path: str | None) -> Path | None:
     return candidate if candidate.is_absolute() else None
 
 
+def _settled(ticket: Ticket) -> bool:
+    """A ticket this reply no longer needs to wait for."""
+
+    return ticket.is_terminal or ticket.awaits_approval
+
+
+def _approval_notice(ticket: Ticket) -> str:
+    """One deterministic line telling the user a ticket is gated."""
+
+    return (
+        f"Ticket {ticket.id} is awaiting_approval: it has NOT run. "
+        f"Approve it with `approve {ticket.id}` or "
+        f"POST /tickets/{ticket.id}/approve (reject with `reject {ticket.id}`)."
+    )
+
+
 def _result_dict(ticket: Ticket) -> dict[str, Any]:
     return {
         "id": ticket.id,
         "description": ticket.description,
         "status": ticket.status.value,
         "worker": ticket.worker,
+        "origin": ticket.origin,
         "workdir": ticket.workdir,
         "summary": ticket.result_summary,
         "artifacts": list(ticket.artifacts),
         "error": ticket.error,
         "exit_code": ticket.exit_code,
+        "review_status": ticket.review_status,
+        "review_reasons": list(ticket.review_reasons),
     }
 
 
 def _describe_ticket(ticket: Ticket) -> str:
     line = f"- {ticket.id} [{ticket.status.value}] {ticket.result_summary or ticket.error or ''}"
+    if ticket.review_status not in ("", "none"):
+        line += f" (review: {ticket.review_status}"
+        if ticket.review_reasons:
+            line += ": " + "; ".join(ticket.review_reasons)
+        line += ")"
     if ticket.artifacts:
         line += f" (artifacts: {', '.join(ticket.artifacts)})"
     return line

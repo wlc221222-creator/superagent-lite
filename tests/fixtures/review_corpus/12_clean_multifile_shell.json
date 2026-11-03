@@ -1,0 +1,8 @@
+{
+  "description": "Create run.sh that prints the text ready when executed.",
+  "artifacts": {
+    "run.sh": "#!/bin/sh\necho ready\n"
+  },
+  "expected": "pass",
+  "note": "Clean pass: a shell script that does exactly what was asked."
+}

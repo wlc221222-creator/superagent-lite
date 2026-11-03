@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,6 +17,17 @@ from typing import Any, Mapping
 CONFIG_FILENAME = "config.json"
 
 DEFAULT_ALLOWED_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
+
+#: Descriptions matching any of these (case-insensitive, anywhere) park the
+#: ticket in ``awaiting_approval``.  Code, not a model: the list is auditable
+#: and deterministic.  Override with ``config.gate_patterns``.
+DEFAULT_GATE_PATTERNS: tuple[str, ...] = (
+    r"删除|delete|remove|rm\s",
+    r"发布|publish|deploy",
+    r"发送|send.*(?:mail|email|message)",
+    r"付款|支付|\bpay\b",
+    r"git push",
+)
 
 # Environment variables that are always passed to the Claude Code child.
 # Everything else is dropped unless listed in ``claude_env_passthrough``.
@@ -96,12 +108,45 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "chat_poll_seconds": 0.25,
     "http_host": "127.0.0.1",
     "http_port": 8765,
+    # --- Phase 5: semantic review, approval gate, decision log ----------
+    # ``review_mode`` is off | shadow | enforce.  Off in code defaults; the
+    # deployment config starts in shadow.  Enforce is a config change (with a
+    # kill switch back to shadow/off) -- never a redeploy.
+    "review_mode": "off",
+    # ``review_enabled`` is the legacy on/off switch; it is kept for the
+    # ``review_enabled: true`` + ``review_model`` spelling, but ``review_mode``
+    # wins when it is not ``off``.
+    "review_enabled": False,
+    # null => review is inactive unless a model is configured.  See
+    # ``normalize_config``: review_mode != off with a null model disables it
+    # loudly instead of failing open.
+    "review_model": None,
+    # Shadow-phase second runner (Revision 3 R1); informational for the eval
+    # harness and the promotion decision.  Never called from the ticket path.
+    "review_shadow_model": None,
+    # Post-promotion spot checker; recorded for the promotion review only.
+    "review_spotcheck_model": None,
+    "review_max_artifact_bytes": 20000,
+    "review_max_total_bytes": 60000,
+    "review_max_retries": 1,
+    "review_max_tokens": 1024,
+    # MUST stay below ``stale_seconds``; normalize_config clamps it and logs.
+    "review_timeout_seconds": 60.0,
+    "review_max_feedback_chars": 1000,
+    # Minimal approval gate: deterministic regex gate, no model involved.
+    "gate_enabled": True,
+    "gate_patterns": list(DEFAULT_GATE_PATTERNS),
+    # Append-only decision log: ``<runtime_dir>/decisions.jsonl``.  A plain
+    # sha256 prev-hash chain; write failures are counted and printed, never
+    # allowed to block ticket processing.
+    "decision_log_enabled": True,
 }
 
 _LIST_DEFAULTS = (
     "claude_extra_args",
     "claude_allowed_tools",
     "claude_env_passthrough",
+    "gate_patterns",
 )
 
 
@@ -247,6 +292,113 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(config["http_host"], str) or not config["http_host"].strip():
         raise ValueError("config.http_host must be a non-empty string")
 
+    config = _normalize_phase5(config)
+    return config
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 keys
+# ---------------------------------------------------------------------------
+REVIEW_MODES = ("off", "shadow", "enforce")
+
+
+def _normalize_phase5(config: dict[str, Any]) -> dict[str, Any]:
+    """Validate review/gate/decision-log keys and apply the startup rules.
+
+    Validation errors raise (a config typo must not be silently ignored);
+    the *policy* decisions -- disabling review when its model is missing,
+    clamping ``review_timeout_seconds`` below ``stale_seconds`` -- are recorded
+    on ``config["_warnings"]`` so the CLI/daemon can print them loudly instead
+    of aborting a self-hosted install over a soft setting.
+    """
+
+    warnings: list[str] = []
+    mode = config.get("review_mode", "off")
+    if not isinstance(mode, str) or mode.strip().lower() not in REVIEW_MODES:
+        raise ValueError(
+            "config.review_mode must be one of: " + ", ".join(REVIEW_MODES)
+        )
+    mode = mode.strip().lower()
+    if not isinstance(config.get("review_enabled"), bool):
+        raise ValueError("config.review_enabled must be a boolean")
+    if config["review_enabled"] and mode == "off":
+        # The phase-5 spec's legacy spelling: ``review_enabled: true`` means
+        # shadow mode.  It never means "enforce" -- promoting is explicit.
+        mode = "shadow"
+    config["review_mode"] = mode
+
+    for key in ("review_model", "review_shadow_model", "review_spotcheck_model"):
+        value = config.get(key)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ValueError(f"config.{key} must be a non-empty string or null")
+        config[key] = value.strip() if isinstance(value, str) else None
+
+    if mode != "off" and not config["review_model"]:
+        warnings.append(
+            f"review_mode={mode!r} but review_model is null; review is DISABLED "
+            "for this process (set review_model to a model name)"
+        )
+        config["review_mode"] = "off"
+    elif mode != "off" and config["review_model"] == config.get("brain_model"):
+        warnings.append(
+            "review_model equals brain_model; the review is not an independent "
+            "cross-check of the planner (same vendor/model family)"
+        )
+
+    for key, minimum in (
+        ("review_max_artifact_bytes", 1),
+        ("review_max_total_bytes", 1),
+        ("review_max_tokens", 1),
+        ("review_max_retries", 0),
+        ("review_max_feedback_chars", 1),
+    ):
+        if isinstance(config[key], bool) or not isinstance(config[key], int):
+            raise ValueError(f"config.{key} must be an integer")
+        if config[key] < minimum:
+            raise ValueError(f"config.{key} must be >= {minimum}")
+    if config["review_max_total_bytes"] < config["review_max_artifact_bytes"]:
+        raise ValueError(
+            "config.review_max_total_bytes must be >= review_max_artifact_bytes"
+        )
+
+    try:
+        timeout = float(config["review_timeout_seconds"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("config.review_timeout_seconds must be a number") from exc
+    if timeout <= 0:
+        raise ValueError("config.review_timeout_seconds must be greater than 0")
+    stale = float(config["stale_seconds"])
+    if timeout >= stale:
+        clamped = max(0.001, stale / 2.0)
+        warnings.append(
+            f"review_timeout_seconds={timeout:g} >= stale_seconds={stale:g}; "
+            f"clamped to {clamped:g}s so a review can never outlive its lease"
+        )
+        timeout = clamped
+    config["review_timeout_seconds"] = timeout
+
+    if not isinstance(config.get("gate_enabled"), bool):
+        raise ValueError("config.gate_enabled must be a boolean")
+    patterns = config.get("gate_patterns")
+    if not isinstance(patterns, list) or not all(
+        isinstance(pattern, str) for pattern in patterns
+    ):
+        raise ValueError("config.gate_patterns must be a list of regex strings")
+    for pattern in patterns:
+        if not pattern.strip():
+            continue
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(
+                f"config.gate_patterns contains an invalid regex {pattern!r}: {exc}"
+            ) from exc
+    config["gate_patterns"] = [pattern for pattern in patterns if pattern.strip()]
+
+    if not isinstance(config.get("decision_log_enabled"), bool):
+        raise ValueError("config.decision_log_enabled must be a boolean")
+
+    config["_warnings"] = warnings
     return config
 
 

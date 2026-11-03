@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
+import shutil
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -30,6 +32,11 @@ CREATE TABLE IF NOT EXISTS tickets (
     max_retries    INTEGER NOT NULL DEFAULT 0,
     attempts       INTEGER NOT NULL DEFAULT 0,
     claim_token    TEXT,
+    origin         TEXT NOT NULL DEFAULT 'cli',
+    review_status  TEXT NOT NULL DEFAULT 'none',
+    review_reasons TEXT,
+    review_attempts INTEGER NOT NULL DEFAULT 0,
+    approval_hash  TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     started_at     TEXT,
@@ -57,6 +64,11 @@ FIELDS: tuple[str, ...] = (
     "max_retries",
     "attempts",
     "claim_token",
+    "origin",
+    "review_status",
+    "review_reasons",
+    "review_attempts",
+    "approval_hash",
     "created_at",
     "updated_at",
     "started_at",
@@ -65,12 +77,19 @@ FIELDS: tuple[str, ...] = (
 )
 
 # Columns added after the first MVP schema; existing databases are migrated.
+# Additive and idempotent (guarded by PRAGMA table_info); every phase-5 column
+# carries a NOT NULL default so legacy rows never hold NULL gate inputs.
 _ADDED_COLUMNS: dict[str, str] = {
     "artifacts": "TEXT",
     "depends_on": "TEXT",
     "attempts": "INTEGER NOT NULL DEFAULT 0",
     "heartbeat_at": "TEXT",
     "claim_token": "TEXT",
+    "origin": "TEXT NOT NULL DEFAULT 'legacy'",
+    "review_status": "TEXT NOT NULL DEFAULT 'none'",
+    "review_reasons": "TEXT",
+    "review_attempts": "INTEGER NOT NULL DEFAULT 0",
+    "approval_hash": "TEXT",
 }
 
 # Fields that callers may update through ``set_status``.
@@ -105,6 +124,8 @@ class TicketStore:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
+        #: Set when ``_migrate`` copied an existing database before ALTERing.
+        self.backup_path: str | None = None
         self._migrate()
         self._conn.commit()
         self._closed = False
@@ -117,11 +138,39 @@ class TicketStore:
             row["name"]
             for row in self._conn.execute("PRAGMA table_info(tickets)").fetchall()
         }
-        for column, declaration in _ADDED_COLUMNS.items():
-            if column not in existing:
-                self._conn.execute(
-                    f"ALTER TABLE tickets ADD COLUMN {column} {declaration}"
-                )
+        missing = [
+            (column, declaration)
+            for column, declaration in _ADDED_COLUMNS.items()
+            if column not in existing
+        ]
+        if missing:
+            # An older build's database lacks phase-5 columns.  Take the one
+            # backup copy before the additive ALTERs (Revision 4).  A fresh
+            # database has every column already, so nothing is copied.
+            self.backup_path = self._backup_before_migration()
+        for column, declaration in missing:
+            self._conn.execute(
+                f"ALTER TABLE tickets ADD COLUMN {column} {declaration}"
+            )
+
+    def _backup_before_migration(self) -> str | None:
+        """Copy the DB file once before the additive ALTERs; return its path."""
+
+        if self.path == ":memory:":
+            return None
+        source = Path(self.path)
+        if not source.is_file() or source.stat().st_size == 0:
+            return None
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup = source.with_name(f"{source.name}.pre-phase5-{stamp}.bak")
+        suffix = 0
+        while backup.exists():  # pragma: no cover - same-second collision
+            suffix += 1
+            backup = source.with_name(
+                f"{source.name}.pre-phase5-{stamp}-{suffix}.bak"
+            )
+        shutil.copy2(source, backup)
+        return str(backup)
 
     # -- writes ---------------------------------------------------------
     def create(self, ticket: Ticket) -> Ticket:
@@ -201,7 +250,6 @@ class TicketStore:
                     or ticket.claim_token != expected_claim_token
                 ):
                     return None
-
             ticket.status = TicketStatus(status)
             for name, value in fields.items():
                 setattr(ticket, name, value)
@@ -224,11 +272,13 @@ class TicketStore:
         token = secrets.token_hex(8)
         with self._lock:
             pending = self.get(ticket_id)
-            if (
-                pending is None
-                or pending.status is not TicketStatus.PENDING
-                or not self._dependencies_done(pending.depends_on)
-            ):
+            if pending is None or pending.status is not TicketStatus.PENDING:
+                return None
+            if not self._dependencies_done(pending.depends_on):
+                # Fail-fast: a dependency that already failed can never be
+                # satisfied, so the ticket is failed now rather than sitting
+                # pending forever.
+                self._fail_blocked_by_dependency(ticket_id, pending.depends_on)
                 return None
             cursor = self._conn.execute(
                 "UPDATE tickets SET status = ?, started_at = ?, heartbeat_at = ?, "
@@ -286,9 +336,13 @@ class TicketStore:
             rows = self._conn.execute(query, params).fetchall()
             ticket_id: str | None = None
             for row in rows:
-                if self._dependencies_done(self._parse_dependencies(row["depends_on"])):
+                dependencies = self._parse_dependencies(row["depends_on"])
+                if self._dependencies_done(dependencies):
                     ticket_id = row["id"]
                     break
+                # A dependency that ended ``failed`` is unsatisfiable: fail
+                # this ticket now instead of leaving it pending forever.
+                self._fail_blocked_by_dependency(row["id"], dependencies)
             if ticket_id is None:
                 return None
             token = secrets.token_hex(8)
@@ -336,8 +390,11 @@ class TicketStore:
         failed: list[Ticket] = []
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, depends_on FROM tickets WHERE status = ?",
-                (TicketStatus.PENDING.value,),
+                "SELECT id, depends_on FROM tickets WHERE status IN (?, ?)",
+                (
+                    TicketStatus.PENDING.value,
+                    TicketStatus.AWAITING_APPROVAL.value,
+                ),
             ).fetchall()
             for row in rows:
                 if ticket_id not in self._parse_dependencies(row["depends_on"]):
@@ -350,6 +407,93 @@ class TicketStore:
                 )
                 failed.append(updated)
         return failed
+
+    # -- approval gate --------------------------------------------------
+    def approve(self, ticket_id: str) -> tuple[Ticket | None, str]:
+        """Move ``awaiting_approval`` -> ``pending``.
+
+        Compare-and-swap on the status, plus the content-hash check: if the
+        description no longer matches what the approver was shown, the
+        approval is refused.  Returns ``(ticket, "")`` or ``(None, reason)``.
+        """
+
+        with self._lock:
+            ticket = self.get(ticket_id)
+            error = self._approval_blocker(ticket_id, ticket)
+            if error:
+                return None, error
+            assert ticket is not None
+            if ticket.approval_hash and (
+                approval_content_hash(ticket.description) != ticket.approval_hash
+            ):
+                return None, (
+                    "description changed since the approval request; "
+                    "refusing to approve stale content"
+                )
+            if not self._cas_approval(
+                ticket_id, TicketStatus.PENDING, "approval_hash = NULL"
+            ):
+                return None, f"ticket {ticket_id} is no longer awaiting_approval"
+        return self.get(ticket_id), ""
+
+    def reject(
+        self, ticket_id: str, *, reason: str = "rejected by approver"
+    ) -> tuple[Ticket | None, str]:
+        """Move ``awaiting_approval`` -> ``failed`` (``rejected by approver``)."""
+
+        with self._lock:
+            ticket = self.get(ticket_id)
+            error = self._approval_blocker(ticket_id, ticket)
+            if error:
+                return None, error
+            if not self._cas_approval(
+                ticket_id,
+                TicketStatus.FAILED,
+                "error = ?, finished_at = ?, approval_hash = NULL",
+                (reason, utc_now()),
+            ):
+                return None, f"ticket {ticket_id} is no longer awaiting_approval"
+        return self.get(ticket_id), ""
+
+    def _cas_approval(
+        self, ticket_id: str, status: TicketStatus, assignments: str, extra: tuple = ()
+    ) -> bool:
+        """``UPDATE ... WHERE id=? AND status='awaiting_approval'``; rowcount is the CAS.
+
+        The check and the write are one statement, so two concurrent
+        ``approve`` calls (CLI + HTTP) cannot both win: the loser sees
+        ``rowcount == 0`` and reports "not awaiting approval".
+        """
+
+        cursor = self._conn.execute(
+            f"UPDATE tickets SET status = ?, updated_at = ?, {assignments} "
+            "WHERE id = ? AND status = ?",
+            (
+                status.value,
+                utc_now(),
+                *extra,
+                ticket_id,
+                TicketStatus.AWAITING_APPROVAL.value,
+            ),
+        )
+        if cursor.rowcount != 1:
+            self._conn.rollback()
+            return False
+        self._conn.commit()
+        return True
+
+    @staticmethod
+    def _approval_blocker(ticket_id: str, ticket: Ticket | None) -> str:
+        """Why this ticket cannot be approved/rejected right now (or "")."""
+
+        if ticket is None:
+            return f"ticket not found: {ticket_id}"
+        if ticket.status is not TicketStatus.AWAITING_APPROVAL:
+            return (
+                f"ticket {ticket_id} is {ticket.status.value}, "
+                "not awaiting_approval"
+            )
+        return ""
 
     def heartbeat(
         self, ticket_id: str, *, claim_token: object = _UNSET
@@ -499,12 +643,40 @@ class TicketStore:
         except (TypeError, ValueError):  # pragma: no cover - defensive
             return []
 
+    def _failed_dependency(self, ticket_ids: list[str]) -> str | None:
+        """Return the first dependency that is already ``failed``, if any."""
+
+        for dependency in ticket_ids:
+            row = self._conn.execute(
+                "SELECT status FROM tickets WHERE id = ?", (dependency,)
+            ).fetchone()
+            if row is not None and row["status"] == TicketStatus.FAILED.value:
+                return str(dependency)
+        return None
+
+    def _fail_blocked_by_dependency(
+        self, ticket_id: str, ticket_ids: list[str]
+    ) -> Ticket | None:
+        """Fail ``ticket_id`` when one of its dependencies already failed."""
+
+        failed_dependency = self._failed_dependency(ticket_ids)
+        if failed_dependency is None:
+            return None
+        return self.set_status(
+            ticket_id,
+            TicketStatus.FAILED,
+            error=f"dependency failed: {failed_dependency}",
+            finished_at=utc_now(),
+        )
+
     def _dependencies_done(self, ticket_ids: list[str]) -> bool:
         """True when every id in ``ticket_ids`` exists and is ``done``.
 
         Unknown ids count as unsatisfied: a dependency on a ticket that was
         never created can only be a planning mistake, and the ticket must not
-        run on an assumption the planner got wrong.
+        run on an assumption the planner got wrong.  A dependency that already
+        failed is fail-fast: the claim path fails the blocked ticket instead of
+        leaving it pending forever (see :meth:`_fail_blocked_by_dependency`).
         """
 
         for dependency in ticket_ids:
@@ -565,6 +737,12 @@ class TicketStore:
 
     def __exit__(self, *_exc_info: object) -> None:
         self.close()
+
+
+def approval_content_hash(description: str) -> str:
+    """sha256 of a ticket description, the value the gate records."""
+
+    return hashlib.sha256(str(description).encode("utf-8")).hexdigest()
 
 
 def _value(value: object) -> object:
@@ -643,6 +821,11 @@ def _from_row(row: sqlite3.Row) -> Ticket:
         max_retries=int(row["max_retries"]),
         attempts=int(row["attempts"] or 0),
         claim_token=row["claim_token"],
+        origin=row["origin"] or "legacy",
+        review_status=row["review_status"] or "none",
+        review_reasons=_string_list(row["review_reasons"]),
+        review_attempts=int(row["review_attempts"] or 0),
+        approval_hash=row["approval_hash"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],

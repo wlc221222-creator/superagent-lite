@@ -165,6 +165,17 @@ class Daemon:
                     pid=os.getpid(),
                 )
             )
+            self._log(
+                "review mode={mode!r} model={model!r} gate={gate} "
+                "decision_log={log_path}".format(
+                    mode=self.config.get("review_mode"),
+                    model=self.config.get("review_model"),
+                    gate=bool(self.config.get("gate_enabled", True)),
+                    log_path=self.router.decision_log.path,
+                )
+            )
+            for warning in self.router.warnings:
+                self._log(f"config warning: {warning}")
             self._start_watchdog()
             self._loop()
         finally:

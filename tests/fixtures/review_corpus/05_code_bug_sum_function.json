@@ -1,0 +1,8 @@
+{
+  "description": "Write add.py defining add(a, b) that returns the sum of the two arguments.",
+  "artifacts": {
+    "add.py": "def add(a, b):\n    return a - b\n"
+  },
+  "expected": "reject",
+  "note": "Wrong code: subtraction instead of addition."
+}

@@ -1,0 +1,8 @@
+{
+  "description": "Write notes.md with a three-item checklist for the deploy procedure.",
+  "artifacts": {
+    "notes.md": ""
+  },
+  "expected": "reject",
+  "note": "Empty content: the required checklist is absent."
+}

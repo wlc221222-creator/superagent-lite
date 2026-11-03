@@ -25,6 +25,10 @@ _SECRET_VALUE_RE = re.compile(r"sk-[A-Za-z0-9_\-]{4,}")
 
 REDACTED = "***"
 
+# Bumped whenever the rules above change; recorded with every semantic review
+# so a verdict can be traced to the redaction rules that produced its input.
+REDACTION_RULE_VERSION = "v1"
+
 # Values shorter than this are not treated as secrets: replacing e.g. ``0`` or
 # ``on`` everywhere in a log would destroy more than it protects.
 _MIN_SECRET_LENGTH = 4
@@ -56,3 +60,22 @@ def sanitize_text(text: str, env: Mapping[str, str] | None = None) -> str:
     for value in secret_env_values(env):
         text = text.replace(value, REDACTED)
     return _SECRET_VALUE_RE.sub(REDACTED, text)
+
+
+def redact_with_count(
+    text: str, env: Mapping[str, str] | None = None
+) -> tuple[str, int]:
+    """Like :func:`sanitize_text`, also returning the number of replacements.
+
+    The review loop records the hit count in the decision log so that a
+    reviewer that keeps seeing ``***`` is visible as such.
+    """
+
+    if not text:
+        return text, 0
+    hits = 0
+    for value in secret_env_values(env):
+        hits += text.count(value)
+        text = text.replace(value, REDACTED)
+    text, pattern_hits = _SECRET_VALUE_RE.subn(REDACTED, text)
+    return text, hits + pattern_hits

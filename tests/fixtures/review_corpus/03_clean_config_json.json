@@ -1,0 +1,8 @@
+{
+  "description": "Create config.json with keys \"name\" set to \"demo\" and \"retries\" set to 3.",
+  "artifacts": {
+    "config.json": "{\n  \"name\": \"demo\",\n  \"retries\": 3\n}\n"
+  },
+  "expected": "pass",
+  "note": "Clean pass: JSON matches the stated keys/values."
+}

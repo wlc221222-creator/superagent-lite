@@ -13,11 +13,20 @@ class TicketStatus(str, Enum):
 
     PENDING = "pending"
     RUNNING = "running"
+    AWAITING_APPROVAL = "awaiting_approval"
     DONE = "done"
     FAILED = "failed"
 
     def __str__(self) -> str:  # pragma: no cover - convenience only
         return self.value
+
+
+#: ``review_status`` values.  ``none`` covers unreviewed/legacy tickets.
+REVIEW_NONE = "none"
+REVIEW_PASSED = "passed"
+REVIEW_REJECTED = "rejected"
+REVIEW_REJECTED_ONCE = "rejected_once"
+REVIEW_INCONCLUSIVE = "inconclusive"
 
 
 def utc_now() -> str:
@@ -74,6 +83,16 @@ class Ticket:
     retry_count: int = 0
     max_retries: int = 0
     claim_token: str | None = None
+    # Phase 5 fields.  Every one has a default so the constructions written
+    # for the earlier phases keep working unchanged, and so a row migrated
+    # from an old database carries explicit (never NULL) gate inputs.
+    origin: str = "cli"
+    review_status: str = REVIEW_NONE
+    review_reasons: list[str] = field(default_factory=list)
+    # Semantic-review rejections, counted separately from execution attempts.
+    review_attempts: int = 0
+    # sha256(description) captured when the approval gate parked the ticket.
+    approval_hash: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     started_at: str | None = None
@@ -83,3 +102,7 @@ class Ticket:
     @property
     def is_terminal(self) -> bool:
         return self.status in (TicketStatus.DONE, TicketStatus.FAILED)
+
+    @property
+    def awaits_approval(self) -> bool:
+        return self.status is TicketStatus.AWAITING_APPROVAL

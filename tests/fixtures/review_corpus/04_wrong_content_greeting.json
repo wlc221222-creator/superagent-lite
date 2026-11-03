@@ -1,0 +1,8 @@
+{
+  "description": "Create greeting.txt containing exactly the word hello.",
+  "artifacts": {
+    "greeting.txt": "goodbye and welcome"
+  },
+  "expected": "reject",
+  "note": "Wrong content: the file says something else entirely."
+}

@@ -15,6 +15,12 @@ Endpoints
                     ``Content-Type`` and a ``Content-Disposition``.  Only
                     regular files inside the ticket's workdir are served;
                     ``../`` and symlink escapes are 404.
+``POST /tickets/<id>/approve`` / ``POST /tickets/<id>/reject``  the
+                    approval gate's control path (token auth, like the rest).
+``GET  /attention``  the read-only "needs attention" list: tickets awaiting
+                    approval and tickets whose semantic review was
+                    inconclusive.  Display only -- approving stays on the
+                    CLI/HTTP control path.
 ``POST /channels/feishu``  Feishu event subscription webhook (see
                     :mod:`superagent_lite.channels`).  It authenticates with
                     Feishu's own verification token, not the static bearer
@@ -43,7 +49,7 @@ import re
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 from urllib.parse import unquote, urlsplit
 
 from .artifacts import (
@@ -69,6 +75,8 @@ _TICKET_ID = r"(?P<id>[A-Za-z0-9_.-]+)"
 _TICKET_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/?$")
 _ARTIFACTS_INDEX = re.compile(rf"^/tickets/{_TICKET_ID}/artifacts/?$")
 _ARTIFACT_FILE = re.compile(rf"^/tickets/{_TICKET_ID}/artifacts/(?P<name>.+)$")
+_APPROVE_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/approve/?$")
+_REJECT_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/reject/?$")
 
 FEISHU_PATH = "/channels/feishu"
 
@@ -144,6 +152,12 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
 
+        if path in ("/attention", "/attention/"):
+            tickets = self.server.brain.router.list(status=None, limit=500)
+            self._send_json(
+                HTTPStatus.OK, {"tickets": needs_attention(tickets)}
+            )
+            return
         match = _ARTIFACT_FILE.match(path)
         if match:
             self._send_artifact(match.group("id"), match.group("name"))
@@ -168,6 +182,15 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in (FEISHU_PATH, FEISHU_PATH + "/"):
             self._handle_feishu()
+            return
+        approve = _APPROVE_PATH.match(path)
+        reject = _REJECT_PATH.match(path)
+        if approve or reject:
+            if not self._authorized():
+                return
+            self._handle_approval(
+                (approve or reject).group("id"), approve=bool(approve)
+            )
             return
         if path not in ("/chat", "/chat/"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -217,6 +240,34 @@ class _Handler(BaseHTTPRequestHandler):
             {"error": "unauthorized"},
         )
         return False
+
+    # -- approval gate --------------------------------------------------
+    def _handle_approval(self, ticket_id: str, *, approve: bool) -> None:
+        """``POST /tickets/<id>/approve|reject`` (the CLI's control path).
+
+        The request body is ignored; the transition itself is the command.
+        A ticket that is not ``awaiting_approval`` is a 409, an unknown id a
+        404 -- both with a plain ``error`` string, like every other route.
+        """
+
+        brain = self.server.brain
+        router = brain.router
+        if router.get(ticket_id) is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND, {"error": f"ticket not found: {ticket_id}"}
+            )
+            return
+        if approve:
+            ticket, error = router.approve(ticket_id)
+        else:
+            ticket, error = router.reject(ticket_id)
+        if ticket is None:
+            self._send_json(HTTPStatus.CONFLICT, {"error": error})
+            return
+        self._send_json(
+            HTTPStatus.OK,
+            {"ok": True, "ticket": ticket_dict(ticket)},
+        )
 
     # -- artifacts ------------------------------------------------------
     def _list_artifacts(self, ticket_id: str) -> None:
@@ -362,6 +413,7 @@ def _queue_counts(brain: Brain) -> dict[str, int]:
         for status in (
             TicketStatus.PENDING,
             TicketStatus.RUNNING,
+            TicketStatus.AWAITING_APPROVAL,
             TicketStatus.DONE,
             TicketStatus.FAILED,
         )
@@ -374,6 +426,7 @@ def ticket_dict(ticket: Ticket) -> dict[str, Any]:
         "description": ticket.description,
         "status": ticket.status.value,
         "worker": ticket.worker,
+        "origin": ticket.origin,
         "workdir": ticket.workdir,
         "depends_on": list(ticket.depends_on),
         "result_summary": ticket.result_summary,
@@ -383,11 +436,44 @@ def ticket_dict(ticket: Ticket) -> dict[str, Any]:
         "attempts": ticket.attempts,
         "retry_count": ticket.retry_count,
         "max_retries": ticket.max_retries,
+        "review_status": ticket.review_status,
+        "review_reasons": list(ticket.review_reasons),
+        "review_attempts": ticket.review_attempts,
         "created_at": ticket.created_at,
         "started_at": ticket.started_at,
         "heartbeat_at": ticket.heartbeat_at,
         "finished_at": ticket.finished_at,
     }
+
+
+def needs_attention(tickets: Iterable[Ticket]) -> list[dict[str, Any]]:
+    """Rows for the read-only "needs attention" list (Revision 4).
+
+    Awaiting-approval tickets plus inconclusive reviews: both are states a
+    human should look at, and neither is a new gate -- the list is display
+    only.  Approval actions stay on the CLI/HTTP control path.
+    """
+
+    attention: list[dict[str, Any]] = []
+    for ticket in tickets:
+        reason = None
+        if ticket.awaits_approval:
+            reason = "awaiting_approval"
+        elif ticket.review_status == "inconclusive":
+            reason = "review_inconclusive"
+        if reason is None:
+            continue
+        attention.append(
+            {
+                "id": ticket.id,
+                "status": ticket.status.value,
+                "reason": reason,
+                "description": ticket.description,
+                "review_status": ticket.review_status,
+                "created_at": ticket.created_at,
+            }
+        )
+    return attention
 
 
 def make_server(

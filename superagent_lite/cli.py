@@ -18,7 +18,18 @@ from .models import Ticket, TicketStatus
 from .router import Router
 
 STATUS_CHOICES = [status.value for status in TicketStatus]
-COMMANDS = ("run", "queue", "daemon", "list", "show", "chat", "serve")
+COMMANDS = (
+    "run",
+    "queue",
+    "daemon",
+    "list",
+    "show",
+    "chat",
+    "serve",
+    "approve",
+    "reject",
+    "decisions",
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -162,6 +173,37 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--model", default=None, help="planner model override")
     serve.add_argument("--memory", default=None, metavar="PATH", help="memory file path")
 
+    approve = subparsers.add_parser(
+        "approve",
+        parents=[common],
+        help="approve a ticket parked by the approval gate (awaiting_approval -> pending)",
+    )
+    approve.add_argument("ticket_id", help="ticket id (see `list --status awaiting_approval`)")
+    approve.add_argument("--json", action="store_true", help="print machine-readable JSON")
+
+    reject = subparsers.add_parser(
+        "reject",
+        parents=[common],
+        help="reject a ticket parked by the approval gate (-> failed)",
+    )
+    reject.add_argument("ticket_id", help="ticket id")
+    reject.add_argument("--json", action="store_true", help="print machine-readable JSON")
+
+    decisions = subparsers.add_parser(
+        "decisions",
+        parents=[common],
+        help="inspect the append-only decision log (verify the hash chain)",
+    )
+    decisions.add_argument(
+        "--verify",
+        action="store_true",
+        help="verify the whole hash chain; exit 1 on the first bad line",
+    )
+    decisions.add_argument(
+        "--limit", type=int, default=20, help="show the last N records (default: 20)"
+    )
+    decisions.add_argument("--json", action="store_true", help="print machine-readable JSON")
+
     return parser
 
 
@@ -204,6 +246,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (OSError, ValueError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    # Phase 5 startup rules: review disabled for lack of a model, review
+    # timeout clamped below stale_seconds, reviewer == planner.  Print loudly
+    # rather than failing a self-hosted install over a soft setting.
+    for warning in config.get("_warnings") or []:
+        print(f"warning: {warning}", file=sys.stderr)
 
     if args.command in ("run", "queue") and args.timeout is not None:
         config["timeout_seconds"] = args.timeout
@@ -247,6 +294,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _cmd_chat(config, args)
     if args.command == "serve":
         return _cmd_serve(config, args)
+    if args.command == "decisions":
+        return _cmd_decisions(config, args)
+
+    if args.command in ("approve", "reject"):
+        # Recovery side effects are explicitly off: approving one ticket must
+        # never fail an unrelated ticket whose heartbeat happens to look stale
+        # from this short-lived process's point of view.
+        try:
+            with Router(config=config, recover_mode="none") as router:
+                return _cmd_approve(router, args, approve=args.command == "approve")
+        except (ValueError, KeyError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         with Router(config=config) as router:
@@ -365,6 +425,79 @@ def _cmd_serve(config: dict, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_approve(
+    router: Router, args: argparse.Namespace, *, approve: bool
+) -> int:
+    if approve:
+        ticket, error = router.approve(args.ticket_id)
+    else:
+        ticket, error = router.reject(args.ticket_id)
+    if ticket is None:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(_ticket_dict(ticket), ensure_ascii=False, indent=2))
+        return 0
+    print(f"ticket: {ticket.id}")
+    print(f"status: {ticket.status.value}")
+    if approve:
+        print("queued: the daemon may now claim and run it")
+    else:
+        print(f"error:  {ticket.error}")
+    return 0
+
+
+def _cmd_decisions(config: dict, args: argparse.Namespace) -> int:
+    from .decision_log import open_decision_log, verify_chain
+
+    log = open_decision_log(
+        Path(config["runtime_dir"]).expanduser(),
+        enabled=bool(config.get("decision_log_enabled", True)),
+    )
+    path = log.path
+    if path is None:
+        print("error: decision_log_enabled is false", file=sys.stderr)
+        return 2
+    status = verify_chain(path)
+    records = status.records
+    if not args.verify:
+        limit = max(1, int(args.limit))
+        records = records[-limit:]
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "path": str(path),
+                    "verify": status.to_dict(),
+                    "records": records,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+    else:
+        if args.verify:
+            if status.ok:
+                print(f"ok: {status.count} record(s) verified in {path}")
+            else:
+                print(
+                    f"BAD: first bad line {status.first_bad_line}: {status.error} "
+                    f"({path})",
+                    file=sys.stderr,
+                )
+        else:
+            print(f"{'TS':<26} {'EVENT':<20} {'TICKET':<26} DETAILS")
+            for record in records:
+                details = json.dumps(record.get("details") or {}, ensure_ascii=False)
+                if len(details) > 70:
+                    details = details[:67] + "..."
+                print(
+                    f"{record.get('ts', ''):<26} {record.get('event', ''):<20} "
+                    f"{str(record.get('ticket_id') or '-'):<26} {details}"
+                )
+    return 0 if status.ok else 1
+
+
 def _cmd_run(router: Router, args: argparse.Namespace) -> int:
     description = " ".join(args.task)
     try:
@@ -469,6 +602,9 @@ def _print_ticket(ticket: Ticket) -> None:
     print(f"exit_code:    {ticket.exit_code if ticket.exit_code is not None else '-'}")
     print(f"attempts:     {ticket.attempts}")
     print(f"retry:        {ticket.retry_count}/{ticket.max_retries}")
+    print(f"origin:       {ticket.origin}")
+    print(f"review:       {ticket.review_status}"
+          + (f" ({'; '.join(ticket.review_reasons)})" if ticket.review_reasons else ""))
     print(f"error:        {ticket.error or '-'}")
     print(f"log:          {ticket.log_path or '-'}")
     print("result:")
@@ -499,6 +635,11 @@ def _ticket_dict(ticket: Ticket) -> dict[str, object]:
         "retry_count": ticket.retry_count,
         "max_retries": ticket.max_retries,
         "claim_token": ticket.claim_token,
+        "origin": ticket.origin,
+        "review_status": ticket.review_status,
+        "review_reasons": list(ticket.review_reasons),
+        "review_attempts": ticket.review_attempts,
+        "approval_hash": ticket.approval_hash,
         "created_at": ticket.created_at,
         "updated_at": ticket.updated_at,
         "started_at": ticket.started_at,
