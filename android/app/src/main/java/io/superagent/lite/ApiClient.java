@@ -192,6 +192,10 @@ public final class ApiClient {
             }
             if (code < 200 || code >= 300) {
                 String serverError = json.optString("error", "");
+                if (serverError.isEmpty()) {
+                    // Brain-level errors arrive as {reply: "...", mode: "error"}.
+                    serverError = json.optString("reply", "");
+                }
                 throw new ApiError(
                         serverError.isEmpty() ? "服务器返回了错误" : "服务器：" + serverError,
                         "HTTP " + code + ": " + text);

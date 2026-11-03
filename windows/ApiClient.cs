@@ -99,6 +99,8 @@ internal sealed class ApiClient
                     using JsonDocument err = JsonDocument.Parse(text);
                     if (err.RootElement.TryGetProperty("error", out var e2))
                         serverError = e2.GetString() ?? "";
+                    else if (err.RootElement.TryGetProperty("reply", out var e3))
+                        serverError = e3.GetString() ?? ""; // Brain errors: {reply, mode:"error"}
                 }
                 catch { /* keep the generic message */ }
                 throw new ApiException(

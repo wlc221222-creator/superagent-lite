@@ -35,6 +35,7 @@ public final class MainActivity extends Activity {
     private Button sendButton;
     private ApiClient api;
     private boolean sending = false;
+    private boolean settingsPrompted = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -53,7 +54,10 @@ public final class MainActivity extends Activity {
     protected void onResume() {
         super.onResume();
         api = ApiClient.fromPrefs(this);
-        if (!api.isConfigured()) {
+        // Prompt once per cold start; re-prompting on every return would
+        // trap the back button if the user leaves settings unsaved.
+        if (!api.isConfigured() && !settingsPrompted) {
+            settingsPrompted = true;
             Toast.makeText(this, "先设置服务器地址和令牌", Toast.LENGTH_LONG).show();
             startActivity(new Intent(this, SettingsActivity.class));
         }
