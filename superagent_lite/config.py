@@ -47,7 +47,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_worker": "echo",
     "claude_binary": "claude",
     "claude_bin": None,
-    "claude_model": "claude-sonnet-5-5",
+    "claude_model": "cn:deepseek-v4.1-flash",
     "claude_extra_args": [],
     "claude_allowed_tools": list(DEFAULT_ALLOWED_TOOLS),
     "claude_max_turns": 25,

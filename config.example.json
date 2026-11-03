@@ -2,7 +2,7 @@
   "default_worker": "echo",
   "claude_bin": null,
   "claude_binary": "claude",
-  "claude_model": "claude-sonnet-5-5",
+  "claude_model": "cn:deepseek-v4.1-flash",
   "claude_extra_args": [],
   "claude_allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
   "claude_max_turns": 25,
