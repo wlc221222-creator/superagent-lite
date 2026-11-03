@@ -448,6 +448,61 @@ class ConversationHistoryTests(BrainCase):
         self.assertEqual(messages[0]["content"], "first")
 
 
+class ReplyPolishTests(BrainCase):
+    def test_pending_message_is_english_for_english_requests(self) -> None:
+        self.script(PLAN_ONE)
+        # No daemon runs, so the ticket cannot finish.
+        reply = self.brain().reply("create hello.txt", timeout=0.1)
+        self.assertEqual(reply.mode, MODE_PENDING)
+        self.assertTrue(reply.timed_out)
+        self.assertTrue(reply.text.startswith("Working on it. Tickets: "))
+        self.assertIn(f"status: {reply.ticket_ids[0]}=pending", reply.text)
+        self.assertIn(f"still pending: {reply.ticket_ids[0]}", reply.text)
+        self.assertIn("`show <ticket_id>`", reply.text)
+
+    def test_pending_message_is_chinese_for_chinese_requests(self) -> None:
+        self.script(PLAN_ONE)
+        reply = self.brain().reply("帮我创建一个 hello.txt", timeout=0.1)
+        self.assertEqual(reply.mode, MODE_PENDING)
+        self.assertTrue(reply.text.startswith("正在处理。工单："))
+        self.assertIn(reply.ticket_ids[0], reply.text)
+        self.assertIn("状态：", reply.text)
+        self.assertIn(f"（仍在进行：{reply.ticket_ids[0]}）", reply.text)
+        self.assertIn("稍后再问我，或用 show <工单号> 查看详情。", reply.text)
+        self.assertNotIn("Working on it", reply.text)
+
+    def test_capability_rule_is_in_the_planner_prompt(self) -> None:
+        from superagent_lite.brain import PLANNER_SYSTEM
+
+        system = " ".join(
+            PLANNER_SYSTEM.format(
+                workers="claude", default_worker="claude", max_tickets=8
+            ).split()
+        )
+        self.assertIn("what can you do", system)
+        self.assertIn("你能做什么", system)
+        self.assertIn("help", system)
+        self.assertIn("files and code", system)
+        self.assertIn("artifacts the user can download", system)
+        self.assertIn("approval", system)
+        self.assertIn("in the user's language", system)
+        # The rendered prompt the brain actually sends carries the rule too.
+        self.script('{"action": "reply", "reply": "ok"}')
+        self.brain().reply("help")
+        sent = " ".join(self.planner.payloads()[0]["system"].split())
+        self.assertIn("what can you do", sent)
+        self.assertIn("artifacts the user can download", sent)
+
+    def test_summary_prompt_forbids_unnecessary_ticket_ids(self) -> None:
+        self.script(PLAN_ONE, "SUMMARY: hello.txt created.")
+        self.start_daemon()
+        self.brain().reply("create hello.txt")
+        system = self.planner.payloads()[-1]["system"]
+        self.assertIn("Do not mention ticket ids unless a ticket failed", system)
+        self.assertIn("short list", system)
+        self.assertIn("compact", system)
+
+
 class BrainBehaviourTests(BrainCase):
     def test_direct_reply_path_creates_no_tickets(self) -> None:
         self.script('{"action": "reply", "reply": "你好，我是你的常驻助手。"}')

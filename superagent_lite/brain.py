@@ -213,13 +213,13 @@ class Brain:
             state = ", ".join(
                 f"{t.id}={t.status.value}" for t in finished
             )
+            message = (
+                _pending_text_cn(ids, state, pending)
+                if _has_cjk(text)
+                else _pending_text_en(ids, state, pending)
+            )
             return ChatReply(
-                text=(
-                    "Working on it. Tickets: " + ", ".join(ids) + "\n"
-                    f"status: {state}\n"
-                    + (f"still pending: {', '.join(pending)}\n" if pending else "")
-                    + "Ask again later or use `show <ticket_id>` for details."
-                ),
+                text=message,
                 mode=MODE_PENDING,
                 ticket_ids=ids,
                 timed_out=True,
@@ -366,7 +366,10 @@ class Brain:
             "files or success that the ticket data does not show. A ticket "
             "whose review_status is rejected or inconclusive must be "
             "reported as such, quoting review_reasons when they are present. "
-            "Be concise and answer in the language of the request."
+            "Do not mention ticket ids unless a ticket failed or waits for "
+            "approval; for multiple tickets use a short list. Keep the whole "
+            "summary compact. Be concise and answer in the language of the "
+            "request."
         )
         return self._complete(
             model=str(self.config["brain_model"]),
@@ -450,8 +453,9 @@ directory; you never touch the user's machine yourself.
 
 Decide one of two actions for the user's message:
 
-1. "reply" -- small talk, questions you can answer from your own knowledge, or
-   anything that does not need the user's machine. Answer directly and briefly.
+1. "reply" -- small talk, questions you can answer from your own knowledge,
+   questions about what you can do, or anything that does not need the user's
+   machine. Answer directly and briefly.
 2. "plan" -- anything that must read, create or modify files, run commands, or
    otherwise inspect or change the user's system. Split it into 1..{max_tickets}
    tickets.
@@ -469,6 +473,11 @@ or
   ]}}
 
 Rules:
+- Questions about your capabilities or help ("你能做什么", "help", "what can
+  you do") get a "reply" action whose answer briefly lists what this system
+  can do: create and edit files and code, run multi-step tasks through
+  workers, produce artifacts the user can download, and hold dangerous
+  actions for approval. Keep it to a few lines, in the user's language.
 - A ticket description must stand alone: the worker sees only that text and
   its working directory. Name exact files, intended contents, and paths.
 - "depends_on" lists ticket ids that must finish first. Add it whenever a
@@ -678,6 +687,39 @@ def _settled(ticket: Ticket) -> bool:
     """A ticket this reply no longer needs to wait for."""
 
     return ticket.is_terminal or ticket.awaits_approval
+
+
+def _has_cjk(text: str) -> bool:
+    """True when the text contains CJK ideographs (so Chinese is the reply)."""
+
+    return any(
+        "一" <= char <= "鿿"
+        or "㐀" <= char <= "䶿"
+        or "豈" <= char <= "﫿"
+        for char in text
+    )
+
+
+def _pending_text_en(ids: Sequence[str], state: str, pending: Sequence[str]) -> str:
+    """The English timeout reply (unchanged wording)."""
+
+    return (
+        "Working on it. Tickets: " + ", ".join(ids) + "\n"
+        f"status: {state}\n"
+        + (f"still pending: {', '.join(pending)}\n" if pending else "")
+        + "Ask again later or use `show <ticket_id>` for details."
+    )
+
+
+def _pending_text_cn(ids: Sequence[str], state: str, pending: Sequence[str]) -> str:
+    """The Chinese timeout reply, matching the English information."""
+
+    return (
+        "正在处理。工单：" + ", ".join(ids) + "\n"
+        f"状态：{state}\n"
+        + (f"（仍在进行：{', '.join(pending)}）\n" if pending else "")
+        + "稍后再问我，或用 show <工单号> 查看详情。"
+    )
 
 
 def _approval_notice(ticket: Ticket) -> str:
