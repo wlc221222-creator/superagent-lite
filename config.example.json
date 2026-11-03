@@ -47,6 +47,8 @@
   "brain_worker": "claude",
   "memory_path": "memory.md",
   "brain_memory_max_chars": 2000,
+  "brain_history_turns": 6,
+  "brain_history_max_chars": 6000,
   "chat_timeout_seconds": 120,
   "chat_poll_seconds": 0.25,
   "http_host": "127.0.0.1",

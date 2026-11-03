@@ -28,6 +28,7 @@ from .memory import read_memory
 from .models import Ticket, TicketStatus, new_ticket_id, utc_now
 from .planner import Endpoint, MessagesClient, PlannerError, load_endpoint
 from .router import Router
+from .threads import THREADS_DIRNAME, ThreadStore
 
 MODE_REPLY = "reply"
 MODE_SUMMARY = "summary"
@@ -37,6 +38,11 @@ MODE_ERROR = "error"
 #: Workers run every ticket; these are the adapter names the planner may pick.
 DEFAULT_MAX_TICKETS = 8
 _STEP_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+#: How much of one exchange is persisted: enough to resolve "that file" and
+#: "the second one" without letting a pasted log grow the thread without bound.
+MAX_STORED_USER_CHARS = 2000
+MAX_STORED_ASSISTANT_CHARS = 1200
 
 
 class CompletionFn(Protocol):
@@ -131,6 +137,8 @@ class Brain:
         self.memory_path = Path(
             memory_path if memory_path is not None else self.config["memory_path"]
         ).expanduser()
+        self.runtime_dir = Path(self.config["runtime_dir"]).expanduser()
+        self.threads = ThreadStore(self.runtime_dir / THREADS_DIRNAME)
         self._sleep = sleep
 
     # -- lifecycle ------------------------------------------------------
@@ -158,6 +166,17 @@ class Brain:
         ``MODE_ERROR`` reply so a REPL or HTTP client always gets an answer.
         """
 
+        answer = self._reply(text, user_id=user_id, timeout=timeout)
+        self._remember(user_id, text, answer)
+        return answer
+
+    def _reply(
+        self,
+        text: str,
+        *,
+        user_id: str,
+        timeout: float | None,
+    ) -> ChatReply:
         text = (text or "").strip()
         if not text:
             return ChatReply(text="(empty message)", mode=MODE_ERROR)
@@ -239,7 +258,8 @@ class Brain:
         """Ask the planner model to decide what to do with ``text``."""
 
         system = self._planner_system_prompt()
-        messages = [
+        history = self._history(user_id)
+        messages = history + [
             {
                 "role": "user",
                 "content": f"User ({user_id}) says:\n{text}",
@@ -360,6 +380,29 @@ class Brain:
             max_tokens=int(self.config["brain_max_tokens"]),
         )
 
+    # -- conversation memory --------------------------------------------
+    def _history(self, user_id: str) -> list[dict[str, str]]:
+        """Earlier exchanges the planner may use to resolve references."""
+
+        turns = int(self.config["brain_history_turns"])
+        max_chars = int(self.config["brain_history_max_chars"])
+        if turns <= 0 or max_chars <= 0:
+            return []
+        return self.threads.history(user_id, max_turns=turns, max_chars=max_chars)
+
+    def _remember(self, user_id: str, request: str, answer: ChatReply) -> None:
+        """Persist one completed exchange; error replies are not history."""
+
+        if answer.mode not in (MODE_REPLY, MODE_SUMMARY, MODE_PENDING):
+            return
+        if int(self.config["brain_history_turns"]) <= 0:
+            return
+        self.threads.append(
+            user_id,
+            request.strip()[:MAX_STORED_USER_CHARS],
+            answer.text[:MAX_STORED_ASSISTANT_CHARS],
+        )
+
     # -- internals ------------------------------------------------------
     def _complete(self, **kwargs: Any) -> str:
         client = self._get_client()
@@ -436,6 +479,10 @@ Rules:
   file or shell access. Ticket ids are t1, t2, ... and must be unique.
 - Never say work is done; only workers execute. Do not describe results you
   have not received yet.
+- The conversation may contain earlier turns from this user. Use them to
+  resolve references like "that file" or "the second one". Ticket
+  descriptions must still stand alone for the workers: expand such references
+  into the description using the history.
 - Answer in the language the user wrote in.
 """
 

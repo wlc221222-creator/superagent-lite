@@ -102,6 +102,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "brain_worker": "claude",
     "memory_path": "memory.md",
     "brain_memory_max_chars": 2000,
+    # Per-user conversation memory: how many earlier exchanges the planner
+    # sees, and the character budget for them.  0 disables history entirely.
+    "brain_history_turns": 6,
+    "brain_history_max_chars": 6000,
     # ``chat`` / ``POST /chat`` wait this long for tickets before replying
     # with ticket ids instead of a summary.
     "chat_timeout_seconds": 120.0,
@@ -284,6 +288,12 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError("config.brain_memory_max_chars must be an integer")
     if config["brain_memory_max_chars"] < 0:
         raise ValueError("config.brain_memory_max_chars must be >= 0")
+
+    for key in ("brain_history_turns", "brain_history_max_chars"):
+        if isinstance(config[key], bool) or not isinstance(config[key], int):
+            raise ValueError(f"config.{key} must be an integer")
+        if config[key] < 0:
+            raise ValueError(f"config.{key} must be >= 0")
 
     if isinstance(config["http_port"], bool) or not isinstance(config["http_port"], int):
         raise ValueError("config.http_port must be an integer")

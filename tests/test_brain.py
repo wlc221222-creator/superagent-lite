@@ -331,6 +331,123 @@ class PlanParsingTests(unittest.TestCase):
             parse_plan(json.dumps(plan), max_tickets=4)
 
 
+class RecordingClient:
+    """A fake planner client that records every ``complete`` call."""
+
+    def __init__(self, *answers: str) -> None:
+        self.answers = list(answers) or ['{"action": "reply", "reply": "ok"}']
+        self.calls: list[dict] = []
+
+    def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        index = min(len(self.calls) - 1, len(self.answers) - 1)
+        return self.answers[index]
+
+
+class ConversationHistoryTests(BrainCase):
+    def brain_with_client(self, client, config: dict | None = None) -> Brain:
+        brain = Brain(
+            config=config or self.config,
+            router=Router(
+                config=config or self.config,
+                workers={"stub": self.worker, "stub_fail": self.worker_fail},
+                recover_mode="none",
+            ),
+            client=client,
+        )
+        self._brains.append(brain)
+        return brain
+
+    def test_history_is_injected_into_the_planner_call(self) -> None:
+        client = RecordingClient(
+            '{"action": "reply", "reply": "first answer"}',
+            '{"action": "reply", "reply": "second answer"}',
+        )
+        brain = self.brain_with_client(client)
+        brain.reply("first question", user_id="alice")
+        brain.reply("what about that file?", user_id="alice")
+
+        messages = client.calls[1]["messages"]
+        self.assertEqual(
+            messages,
+            [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+                {
+                    "role": "user",
+                    "content": "User (alice) says:\nwhat about that file?",
+                },
+            ],
+        )
+
+    def test_history_is_per_user(self) -> None:
+        client = RecordingClient()
+        brain = self.brain_with_client(client)
+        brain.reply("alice question", user_id="alice")
+        brain.reply("bob question", user_id="bob")
+        messages = client.calls[1]["messages"]
+        self.assertEqual(len(messages), 1)
+        self.assertIn("bob question", messages[0]["content"])
+
+    def test_a_turn_is_persisted_after_reply(self) -> None:
+        client = RecordingClient('{"action": "reply", "reply": "stored answer"}')
+        brain = self.brain_with_client(client)
+        brain.reply("stored question", user_id="alice")
+        history = brain.threads.history("alice", max_turns=10, max_chars=10_000)
+        self.assertEqual(
+            history,
+            [
+                {"role": "user", "content": "stored question"},
+                {"role": "assistant", "content": "stored answer"},
+            ],
+        )
+
+    def test_oversized_turns_are_capped_before_storage(self) -> None:
+        answer = json.dumps({"action": "reply", "reply": "a" * 5000})
+        client = RecordingClient(answer)
+        brain = self.brain_with_client(client)
+        brain.reply("u" * 5000, user_id="alice")
+        history = brain.threads.history("alice", max_turns=10, max_chars=100_000)
+        self.assertEqual(len(history[0]["content"]), 2000)
+        self.assertEqual(len(history[1]["content"]), 1200)
+
+    def test_error_replies_are_not_stored(self) -> None:
+        class FailingClient:
+            def complete(self, **_kwargs):
+                raise PlannerError("planner is down")
+
+        brain = self.brain_with_client(FailingClient())
+        reply = brain.reply("hello", user_id="alice")
+        self.assertEqual(reply.mode, MODE_ERROR)
+        self.assertEqual(
+            brain.threads.history("alice", max_turns=10, max_chars=10_000), []
+        )
+
+    def test_history_is_disabled_when_turns_is_zero(self) -> None:
+        client = RecordingClient(
+            '{"action": "reply", "reply": "one"}',
+            '{"action": "reply", "reply": "two"}',
+        )
+        config = dict(self.config, brain_history_turns=0)
+        brain = self.brain_with_client(client, config)
+        brain.reply("first", user_id="alice")
+        brain.reply("second", user_id="alice")
+        self.assertEqual(len(client.calls[1]["messages"]), 1)
+        self.assertEqual(
+            brain.threads.history("alice", max_turns=10, max_chars=10_000), []
+        )
+
+    def test_history_respects_the_configured_turn_limit(self) -> None:
+        client = RecordingClient('{"action": "reply", "reply": "ok"}')
+        config = dict(self.config, brain_history_turns=1)
+        brain = self.brain_with_client(client, config)
+        brain.reply("first", user_id="alice")
+        brain.reply("second", user_id="alice")
+        messages = client.calls[1]["messages"]
+        self.assertEqual(len(messages), 3)  # one turn: user + assistant + new
+        self.assertEqual(messages[0]["content"], "first")
+
+
 class BrainBehaviourTests(BrainCase):
     def test_direct_reply_path_creates_no_tickets(self) -> None:
         self.script('{"action": "reply", "reply": "你好，我是你的常驻助手。"}')
