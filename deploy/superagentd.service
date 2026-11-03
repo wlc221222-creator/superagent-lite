@@ -1,0 +1,31 @@
+[Unit]
+Description=superagent-lite queue daemon (superagentd)
+Documentation=file:/opt/superagent-lite/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# One line to change if the project lives elsewhere; deploy/install.sh rewrites
+# it to the real install directory.
+WorkingDirectory=/opt/superagent-lite
+Environment=PYTHONUNBUFFERED=1
+# Optional: create /etc/superagent/superagentd.env to add variables (for
+# example SUPERAGENT_HTTP_TOKEN is NOT needed here; the daemon never serves
+# HTTP).  A missing file is not an error.
+EnvironmentFile=-/etc/superagent/superagentd.env
+ExecStart=/usr/bin/env python3 -m superagent_lite --config /opt/superagent-lite/config.json daemon
+Restart=on-failure
+RestartSec=5
+# Give in-flight tickets time to finish; the daemon requeues whatever is
+# still running after daemon_shutdown_grace_seconds.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+# Modest hardening: the process only needs its own runtime directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

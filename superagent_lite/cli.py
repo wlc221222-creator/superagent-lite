@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .brain import Brain
+from .channels import settings_from_env
 from .config import load_config
 from .daemon import Daemon, DaemonAlreadyRunning
 from .http_api import ApiConfig, make_server, token_from_env
@@ -338,12 +339,23 @@ def _cmd_serve(config: dict, args: argparse.Namespace) -> int:
         )
 
     api = ApiConfig(host=host, port=int(port), token=token)
+    channel_log = Path(config["runtime_dir"]).expanduser() / "channel.log"
     with Brain(config=config) as brain:
-        server = make_server(brain, api)
+        server = make_server(brain, api, channel_log=channel_log)
         actual_host, actual_port = server.server_address[:2]
         print(f"superagent http api on http://{actual_host}:{actual_port}")
+        print(f"web ui: http://{actual_host}:{actual_port}/")
         print(f"auth: {'static token' if token else 'open (no SUPERAGENT_HTTP_TOKEN)'}")
         print(f"planner model: {config['brain_model']}")
+        feishu = settings_from_env()
+        print(
+            "feishu channel: "
+            + (
+                "credentials configured (replies sent)"
+                if feishu.has_credentials
+                else "no FEISHU_APP_ID/FEISHU_APP_SECRET (events are logged only)"
+            )
+        )
         try:
             server.serve_forever(poll_interval=0.2)
         except KeyboardInterrupt:

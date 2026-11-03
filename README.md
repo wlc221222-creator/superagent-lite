@@ -176,14 +176,41 @@ or a reply. Only the model name is configurable:
 
 | Request | Response |
 | --- | --- |
+| `GET /` | the single-file web chat UI (public; no external resources) |
 | `POST /chat` `{"text": "...", "user_id": "..."}` | `{"reply", "mode", "ticket_ids", "timed_out", "model"}`; `mode` is `reply` / `summary` / `pending` (timeout) / `error` (502) |
 | `GET /tickets/<id>` | the ticket, including `status`, `artifacts`, `result_summary`, `depends_on` |
+| `GET /tickets/<id>/artifacts` | `{"ticket_id", "artifacts": [{"name", "size", "exists", "url"}]}` |
+| `GET /tickets/<id>/artifacts/<name>` | the artifact bytes, with a guessed `Content-Type` and `Content-Disposition: attachment` |
+| `POST /channels/feishu` | Feishu event webhook (see below) |
 | `GET /health` | liveness and queue counters (never authenticated) |
 
-When `SUPERAGENT_HTTP_TOKEN` is set, every endpoint except `/health` requires
-`Authorization: Bearer <token>` (or `X-SuperAgent-Token`); anything else is a
-401 before the body is read, comparisons use `hmac.compare_digest`. Unset, the
-server is open -- `serve` warns if that happens on a non-loopback address.
+When `SUPERAGENT_HTTP_TOKEN` is set, every endpoint except `/health`, `GET /`
+and the Feishu webhook requires `Authorization: Bearer <token>` (or
+`X-SuperAgent-Token`); anything else is a 401 before the body is read,
+comparisons use `hmac.compare_digest`. Unset, the server is open -- `serve`
+warns if that happens on a non-loopback address. `GET /` is public so a
+browser can load the page and type a token into it; the page's API calls are
+authenticated like any other client's.
+
+#### Web UI
+
+Open `http://<host>:<port>/` and paste the token into the field at the top
+right (it is kept in `sessionStorage`, never in the URL). The page posts your
+message to `/chat`, prints the reply, and if the reply carries ticket ids it
+polls `GET /tickets/<id>` to show each ticket's status, summary and artifact
+links. Downloads go through `GET /tickets/<id>/artifacts/<name>` with the same
+token. The whole page is one HTML document with inline CSS/JS in
+`superagent_lite/webui.py` -- no CDN, no build step.
+
+#### Artifact downloads
+
+Only files **inside the ticket's working directory** are servable. The
+requested name is resolved (symlinks included) and must remain under the
+resolved workdir, so `../secret`, `%2e%2e%2fsecret`, absolute paths, symlinks
+pointing outside and directories all return 404 -- the same answer as a file
+that simply does not exist, so a client cannot probe the host filesystem.
+`GET /tickets/<id>/artifacts` lists what the ticket *recorded*, and marks
+entries that were deleted or never created with `"exists": false`.
 
 ```bash
 SUPERAGENT_HTTP_TOKEN=... python -m superagent_lite serve --port 8765
@@ -191,7 +218,128 @@ curl -s localhost:8765/chat -H 'Authorization: Bearer ...' \
      -H 'Content-Type: application/json' \
      -d '{"text": "create /tmp/demo/hello.txt containing hi"}'
 curl -s localhost:8765/tickets/<id> -H 'Authorization: Bearer ...'
+curl -s localhost:8765/tickets/<id>/artifacts -H 'Authorization: Bearer ...'
+curl -sOJ localhost:8765/tickets/<id>/artifacts/hello.txt -H 'Authorization: Bearer ...'
 ```
+
+#### Feishu (Lark) channel
+
+`POST /channels/feishu` is a skeleton for the Feishu event subscription API:
+
+- **`url_verification`** -- Feishu's setup handshake; the payload's
+  `challenge` is echoed back as `{"challenge": "..."}`.
+- **`im.message.receive_v1`** with a text message -- the text is extracted and
+  passed to the same `Brain` the web UI uses. If `FEISHU_APP_ID` and
+  `FEISHU_APP_SECRET` are set, the reply is sent to the chat through
+  `open.feishu.cn`; otherwise it is only written to the channel log
+  (`runtime/channel.log` by default; override with `SUPERAGENT_CHANNEL_LOG`).
+- Other events, non-text messages and messages sent by a bot are acknowledged
+  with 200 and ignored. A brain or Feishu-API failure is logged and still
+  acknowledged, because anything else makes Feishu re-deliver the event and
+  run the task a second time.
+
+The webhook authenticates with Feishu's own `token` field, not the static
+bearer token (Feishu cannot send custom headers). Set
+`FEISHU_VERIFICATION_TOKEN` to the verification token from the Feishu app
+console and mismatching payloads are refused with 401.
+
+**Feishu setup (you need your own app; nothing here creates or stores one):**
+
+1. In the Feishu open platform ("开发者后台"), create a custom app
+   (企业自建应用) and note its **App ID** and **App Secret**.
+2. Enable the **bot** capability and add the permission
+   `im:message` (receive messages) plus `im:message:send_as_bot` (send
+   replies). Publish a version of the app for the tenant.
+3. Under **Events & Callbacks** set the request URL to
+   `https://<your-host>/channels/feishu` and add the event
+   `im.message.receive_v1`. Feishu sends the `url_verification` challenge
+   immediately -- the endpoint must already be reachable, which is why the
+   recommended path is a reverse proxy or private network (below).
+4. Copy the **Verification Token** from the same page and export the three
+   variables (never commit them):
+
+   ```bash
+   FEISHU_APP_ID=cli_xxx FEISHU_APP_SECRET=xxx FEISHU_VERIFICATION_TOKEN=xxx \
+     python -m superagent_lite serve --port 8765
+   ```
+
+   Under systemd put them in `/etc/superagent/superagent-http.env` (created by
+   `deploy/install.sh`, mode 600).
+5. Add the bot to the chat you want to talk from and send it a message.
+
+Not implemented in this phase: Feishu's encrypted/signed request scheme
+(`Encrypt Key`, `X-Lark-Signature`), rich-text/card replies, file uploads and
+per-user session state. Until signature verification is added, do not expose
+the webhook to the open internet.
+
+#### Deployment and remote access (部署与远程访问)
+
+The two long-running processes are the queue daemon and the HTTP API. Both run
+from the project directory and read `./config.json` (or `--config PATH`).
+
+Recommended topology: **daemon and HTTP on one host, reachable only over a
+private network.**
+
+```
+  browser ──https──▶ reverse proxy (Caddy/nginx, TLS, auth) ──▶ 127.0.0.1:8765
+  Feishu  ──https──▶ same proxy ────────────────────────────▶ 127.0.0.1:8765/channels/feishu
+                                                                    │
+                                              superagent-http (serve)│ enqueues
+                                                                    ▼
+                                              superagentd ──▶ claude / echo workers
+```
+
+**systemd**
+
+```bash
+# on the target host, from a checkout of this repo:
+sudo ./deploy/install.sh                 # PREFIX=/opt/superagent-lite by default
+#   SERVICE_USER=deploy PREFIX=/srv/superagent sudo -E ./deploy/install.sh
+```
+
+`install.sh` is idempotent: it copies the source, creates `config.json` only
+if none exists, creates `/etc/superagent/superagentd.env` and
+`/etc/superagent/superagent-http.env` (mode 600) only if absent, rewrites
+`WorkingDirectory`/`ExecStart` to the install prefix, and then
+`systemctl daemon-reload && systemctl enable --now`. It refuses to run as a
+non-root user and checks for systemd and Python >= 3.11 first. `NO_START=1`
+installs without starting.
+
+Both units use `Restart=on-failure` and an optional `EnvironmentFile=-...`, so
+a missing env file is not an error. The daemon needs no token; the HTTP unit
+needs `SUPERAGENT_HTTP_TOKEN` in its env file as soon as it is reachable by
+anyone but you.
+
+```bash
+systemctl status superagentd superagent-http
+journalctl -u superagentd -f
+```
+
+**Bind address** -- set `http_host` / `http_port` in `config.json`
+(`serve --host/--port` override them):
+
+| `http_host` | Use |
+| --- | --- |
+| `127.0.0.1` (default) | local browser or a reverse proxy on the same host |
+| a Tailscale/WireGuard address | direct access from your own devices |
+| `0.0.0.0` | only behind a firewall **and** with `SUPERAGENT_HTTP_TOKEN` set |
+
+**Remote access, in order of preference** (推荐：内网 / Tailscale / 反向代理 + token，
+不要把服务裸奔在公网上):
+
+1. **Private network (Tailscale / WireGuard / an SSH tunnel)** -- keep
+   `http_host` on the tailnet address or on `127.0.0.1` and forward a local
+   port: `ssh -L 8765:127.0.0.1:8765 user@host`. No public listener at all.
+2. **Reverse proxy with TLS + auth** -- nginx/Caddy in front of
+   `127.0.0.1:8765`, terminating HTTPS, adding basic auth or OIDC, and
+   forwarding the `Authorization` header (or injecting the token).
+   `/channels/feishu` needs a public HTTPS URL, so it is the one path that
+   usually must be proxied; restrict it to Feishu's IP ranges if you can.
+3. **Never bind `0.0.0.0` on the open internet.** Anyone who reaches `/chat`
+   can run tasks -- file writes, shell commands -- as the service user. The
+   static token is a shared secret with no rate limiting; treat it as
+   defence in depth, not as the only lock. `serve` warns when it binds a
+   non-loopback address without a token.
 
 Guarantees, stated precisely: a ticket in a terminal state (`done` /
 `failed`) is never executed again, and a queued ticket is not lost. An
@@ -270,6 +418,7 @@ python tests/test_smoke.py
 python tests/test_contract.py
 python tests/test_daemon.py
 python tests/test_brain.py
+python tests/test_phase4.py
 ```
 
 The Brain/HTTP tests never touch the network: they start a stub
@@ -284,6 +433,7 @@ runtime/
 ├── logs/<ticket_id>.log   # full stdout/stderr + lifecycle events
 ├── work/<ticket_id>/      # isolated cwd for each ticket
 ├── superagentd.log        # daemon lifecycle log
+├── channel.log            # Feishu channel events and replies
 └── superagentd.lock       # one-daemon-per-runtime lock
 ```
 
@@ -455,7 +605,10 @@ superagent_lite/
 ├── brain.py             # planner: reply-or-decompose, enqueue, wait, summarize
 ├── planner.py           # /v1/messages client; endpoint read from ~/.claude/settings.json
 ├── memory.py            # memory.md loading + truncation
-├── http_api.py          # POST /chat, GET /tickets/<id>, static-token auth
+├── http_api.py          # /chat, /tickets, artifact download, Feishu webhook, auth
+├── webui.py             # single-file HTML chat page served at GET /
+├── artifacts.py         # workdir-confined artifact listing / resolution
+├── channels.py          # Feishu event parsing, url_verification, outbound API
 ├── result.py            # RESULT contract: prompt, parsing, verdict
 ├── redact.py            # secret redaction for logs
 ├── logs.py              # redacting log writer
@@ -471,7 +624,12 @@ tests/
 ├── test_contract.py     # contract, boundary, discovery, heartbeat tests
 ├── test_daemon.py       # queue → daemon → done, restart, pool, shutdown
 ├── test_brain.py        # planner stub, chat, HTTP API, memory, depends_on
+├── test_phase4.py       # web UI, artifact download/traversal, Feishu, deploy assets
 └── support.py           # stub claude CLI + stub /v1/messages planner
+deploy/
+├── superagentd.service  # systemd unit for the queue daemon
+├── superagent-http.service  # systemd unit for the HTTP API + web UI
+└── install.sh           # idempotent installer for both units
 config.example.json
 memory.md                # hand-maintained planner memory (template)
 main.py                  # equivalent entry point
@@ -480,9 +638,10 @@ main.py                  # equivalent entry point
 ## Roadmap
 
 - **Codex adapter** — implement `CodexWorker.run` against the Codex CLI.
-- **Messaging channels** — receive tasks and reply through chat platforms
-  (on top of the token-authenticated HTTP API).
-- **Web UI** — a browser front end for the same `/chat` endpoint.
+- **Messaging channels** — Feishu is a skeleton; add signed-request
+  verification, more event types and other platforms (Slack, Telegram).
+- **Web UI** — the page is functional but minimal: no conversation history,
+  no per-user sessions, no artifact preview.
 - **Automatic memory distillation** — write `memory.md` from finished chats.
 - **Multi-daemon** — claims and leases are already atomic; a coordinator or
   a shared watchdog would let several hosts drain one queue.
@@ -492,3 +651,9 @@ main.py                  # equivalent entry point
 
 Web UI, multi-user permissions and per-user isolation, automatic memory
 distillation, and DAG-aware scheduling beyond `depends_on` gating.
+
+## Out of scope for phase 4
+
+Multi-user login/sessions in the web UI, encrypted Feishu callbacks, other
+messaging channels, artifact previews, and containerised deployment (the
+units assume a plain host install).

@@ -1,0 +1,28 @@
+[Unit]
+Description=superagent-lite HTTP API and web chat UI
+Documentation=file:/opt/superagent-lite/README.md
+After=network-online.target
+Wants=network-online.target
+# The HTTP API only enqueues and observes; the daemon does the work.
+After=superagentd.service
+Wants=superagentd.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/superagent-lite
+Environment=PYTHONUNBUFFERED=1
+# Optional: put SUPERAGENT_HTTP_TOKEN here (and Feishu credentials if you use
+# the channel).  Never commit this file.  A missing file is not an error.
+EnvironmentFile=-/etc/superagent/superagent-http.env
+ExecStart=/usr/bin/env python3 -m superagent_lite --config /opt/superagent-lite/config.json serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
