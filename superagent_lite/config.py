@@ -59,7 +59,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "timeout_seconds": 300.0,
     "stale_seconds": 300.0,
     "heartbeat_seconds": 15.0,
-    "max_attempts": 1,
+    # How many times an interrupted ticket may be put back on the queue
+    # before it is failed for good.
+    "max_retries": 1,
+    # superagentd: worker pool size, queue poll interval, watchdog interval
+    # and how long a graceful shutdown waits for in-flight runs.
+    "daemon_concurrency": 2,
+    "daemon_poll_seconds": 0.5,
+    "daemon_watchdog_seconds": 5.0,
+    "daemon_shutdown_grace_seconds": 30.0,
     "runtime_dir": "runtime",
 }
 
@@ -127,7 +135,13 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
     if config["claude_max_turns"] <= 0:
         raise ValueError("config.claude_max_turns must be greater than 0")
 
-    for key in ("timeout_seconds", "stale_seconds", "heartbeat_seconds"):
+    for key in (
+        "timeout_seconds",
+        "stale_seconds",
+        "heartbeat_seconds",
+        "daemon_poll_seconds",
+        "daemon_watchdog_seconds",
+    ):
         try:
             number = float(config[key])
         except (TypeError, ValueError) as exc:
@@ -136,10 +150,22 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
             raise ValueError(f"config.{key} must be greater than 0")
         config[key] = number
 
-    if isinstance(config["max_attempts"], bool) or not isinstance(
-        config["max_attempts"], int
-    ) or config["max_attempts"] < 1:
-        raise ValueError("config.max_attempts must be an integer >= 1")
+    grace = config["daemon_shutdown_grace_seconds"]
+    try:
+        grace = float(grace)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "config.daemon_shutdown_grace_seconds must be a number"
+        ) from exc
+    if grace < 0:
+        raise ValueError("config.daemon_shutdown_grace_seconds must be >= 0")
+    config["daemon_shutdown_grace_seconds"] = grace
+
+    for key, minimum in (("daemon_concurrency", 1), ("max_retries", 0)):
+        if isinstance(config[key], bool) or not isinstance(config[key], int):
+            raise ValueError(f"config.{key} must be an integer")
+        if config[key] < minimum:
+            raise ValueError(f"config.{key} must be >= {minimum}")
 
     if not isinstance(config["runtime_dir"], (str, Path)) or not str(config["runtime_dir"]):
         raise ValueError("config.runtime_dir must be a non-empty path string")

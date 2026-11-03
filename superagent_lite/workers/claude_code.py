@@ -113,9 +113,12 @@ class ClaudeCodeWorker(Worker):
             + "\n",
         )
 
-        # The router normally drives the heartbeat (it owns the ticket row);
-        # the adapter can also tick on its own when used standalone.
-        ticker = _Heartbeat(on_heartbeat, self.heartbeat_interval)
+        # The router already runs a heartbeat ticker for the ticket and passes
+        # it in as ``on_heartbeat`` (it also ticks through the blocking
+        # ``communicate`` call, which a timer cannot do).  Starting a second
+        # ticker here would double every heartbeat write and log line, so the
+        # adapter only ticks on its own when used standalone.
+        ticker = _Heartbeat(None, self.heartbeat_interval)
 
         try:
             process = subprocess.Popen(

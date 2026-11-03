@@ -43,8 +43,72 @@ lies about a ticket that is still executing.
 A **Ticket** is the unit of work: `id`, `description`, `status`
 (`pending` / `running` / `done` / `failed`), assigned worker, working
 directory, timeout, result summary, `artifacts`, error, exit code, `attempts`,
-full log path, and timestamps (`created_at`, `started_at`, `heartbeat_at`,
-`finished_at`). Tickets are persisted in SQLite, so a restart loses nothing.
+`retry_count` / `max_retries`, `claim_token`, full log path, and timestamps
+(`created_at`, `started_at`, `heartbeat_at`, `finished_at`). Tickets are
+persisted in SQLite, so a restart loses nothing.
+
+### superagentd: the resident daemon (phase 3, milestone A)
+
+`run` executes a ticket synchronously. For a resident setup there is
+`superagentd`: a foreground daemon that owns the queue and a worker pool.
+
+```
+     superagent queue "…"          superagent list / show
+             │                             ▲
+             ▼                             │
+    ┌────────────────────────────────────────────────────┐
+    │ superagentd                                        │
+    │  main loop ─▶ claim (UPDATE … WHERE pending) ─┐    │
+    │  watchdog ─▶ requeue stale running tickets    │    │
+    │                    worker pool (N threads) ◀──┘    │
+    │                    Router + result contract        │
+    └────────────────────────────────────────────────────┘
+```
+
+- **Enqueue** (`superagent queue`) writes a `pending` ticket and returns; the
+  submitting side never waits for execution.
+- **Claiming** is a single conditional `UPDATE ... WHERE status='pending'`
+  that also writes a fresh `claim_token`. Two daemons (or a daemon racing a
+  synchronous `run`) cannot execute the same ticket twice.
+- **Pool** -- `daemon_concurrency` tickets run at once (default 2). Workers
+  are the same adapters as `run`, so the result contract and sandboxing are
+  unchanged.
+- **Heartbeats** -- each run refreshes `heartbeat_at` every
+  `heartbeat_seconds`, guarded by its lease token.
+- **Watchdog** -- every `daemon_watchdog_seconds` a running ticket whose
+  heartbeat is older than `stale_seconds` is put back on the queue
+  (`retry_count` + 1) or failed once `max_retries` is spent.
+- **Restart recovery** -- an exclusive lock file
+  (`runtime/superagentd.lock`) allows one daemon per runtime directory. At
+  startup every `running` ticket is therefore an orphan of a dead process
+  and is requeued before the pool starts; completed tickets are never
+  re-run.
+- **Graceful shutdown** -- SIGTERM/SIGINT stops new claims, gives in-flight
+  runs `daemon_shutdown_grace_seconds` to finish, then requeues whatever is
+  still running. A late result from an abandoned run carries a stale lease
+  token and is discarded, so it cannot overwrite the requeued row.
+
+A non-daemon `run`/`show`/`list` still recovers stale tickets, but it fails
+them (iteration 2 behaviour) rather than requeueing them.
+
+Guarantees, stated precisely: a ticket in a terminal state (`done` /
+`failed`) is never executed again, and a queued ticket is not lost. An
+**interrupted** run is retried, so a task that was half-way through when its
+daemon died can run its side effects twice (at-least-once, like any queue
+without task-level idempotency). If the daemon is SIGKILLed, the `claude`
+child it started may outlive it for a moment; it can no longer write ticket
+state (the lease token is gone) but it can still touch its workdir.
+
+```bash
+# terminal 1
+python -m superagent_lite daemon --concurrency 2
+
+# terminal 2
+python -m superagent_lite queue "写一个测试任务" --worker echo
+python -m superagent_lite show <ticket_id> --log
+```
+
+The daemon logs lifecycle lines to stdout and to `runtime/superagentd.log`.
 
 ### Result contract (who decides `done`)
 
@@ -102,6 +166,7 @@ python -m unittest discover -s tests
 # or one file at a time:
 python tests/test_smoke.py
 python tests/test_contract.py
+python tests/test_daemon.py
 ```
 
 Everything lands under `runtime/` by default:
@@ -110,7 +175,9 @@ Everything lands under `runtime/` by default:
 runtime/
 ├── superagent.db          # tickets
 ├── logs/<ticket_id>.log   # full stdout/stderr + lifecycle events
-└── work/<ticket_id>/      # isolated cwd for each ticket
+├── work/<ticket_id>/      # isolated cwd for each ticket
+├── superagentd.log        # daemon lifecycle log
+└── superagentd.lock       # one-daemon-per-runtime lock
 ```
 
 ### CLI commands
@@ -118,6 +185,8 @@ runtime/
 | Command | Description |
 | --- | --- |
 | `python -m superagent_lite run "<task>" --worker echo\|claude\|codex` | Create a ticket, execute it, print the summary |
+| `python -m superagent_lite queue "<task>" [--worker …] [--json]` | Create a `pending` ticket without executing it |
+| `python -m superagent_lite daemon [--concurrency N] [--poll S] [--max-retries N]` | Run superagentd in the foreground |
 | `python -m superagent_lite list [--status done] [--limit 20] [--json]` | List tickets, newest first |
 | `python -m superagent_lite show <ticket_id> [--log] [--json]` | Show one ticket and its result |
 
@@ -144,6 +213,11 @@ See `config.example.json` for the full set; the essentials are:
   "timeout_seconds": 300,
   "stale_seconds": 300,
   "heartbeat_seconds": 15,
+  "max_retries": 1,
+  "daemon_concurrency": 2,
+  "daemon_poll_seconds": 0.5,
+  "daemon_watchdog_seconds": 5,
+  "daemon_shutdown_grace_seconds": 30,
   "runtime_dir": "runtime"
 }
 ```
@@ -160,8 +234,13 @@ See `config.example.json` for the full set; the essentials are:
 | `claude_permission_mode` | `--permission-mode` (default `acceptEdits`); `null` to omit |
 | `claude_env_passthrough` | Allow-list of parent env vars forwarded to the child |
 | `timeout_seconds` | Per-ticket timeout (a hard kill of the process group) |
-| `stale_seconds` | A `running` ticket without a heartbeat this old is failed at startup |
+| `stale_seconds` | A `running` ticket whose heartbeat is this old is stale (failed by the CLI, requeued by the daemon) |
 | `heartbeat_seconds` | How often the router refreshes `heartbeat_at` during a run |
+| `max_retries` | How many interruptions a ticket survives before it is failed for good |
+| `daemon_concurrency` | Worker pool size (default 2) |
+| `daemon_poll_seconds` | How often an idle daemon checks the queue |
+| `daemon_watchdog_seconds` | How often the watchdog looks for stale running tickets |
+| `daemon_shutdown_grace_seconds` | On SIGTERM, how long in-flight runs may finish before being requeued |
 | `runtime_dir` | Base directory for the DB, logs and workdirs |
 
 ### Binary discovery
@@ -238,8 +317,9 @@ marks the ticket `failed`. Run `show <id> --log` to audit a run.
 ```
 superagent_lite/
 ├── models.py            # Ticket + TicketStatus
-├── store.py             # SQLite ticket store (+ stale-run recovery)
-├── router.py            # submit / dispatch / heartbeat / result judgement
+├── store.py             # SQLite queue: atomic claim, leases, requeue, recovery
+├── router.py            # enqueue / dispatch / heartbeat / result judgement
+├── daemon.py            # superagentd: pool, watchdog, graceful shutdown
 ├── result.py            # RESULT contract: prompt, parsing, verdict
 ├── redact.py            # secret redaction for logs
 ├── logs.py              # redacting log writer
@@ -253,6 +333,7 @@ superagent_lite/
 tests/
 ├── test_smoke.py        # create → execute → complete → query
 ├── test_contract.py     # contract, boundary, discovery, heartbeat tests
+├── test_daemon.py       # queue → daemon → done, restart, pool, shutdown
 └── support.py           # stub claude CLI used by the tests
 config.example.json
 main.py                  # equivalent entry point
@@ -263,12 +344,13 @@ main.py                  # equivalent entry point
 - **Codex adapter** — implement `CodexWorker.run` against the Codex CLI.
 - **HTTP API** — expose `submit` / `list` / `result` as a small service.
 - **Messaging channels** — receive tasks and reply through chat platforms.
-- **Automatic retry** — heartbeat-based stale recovery landed in iteration 2;
-  `retry_count` / `max_retries` and `max_attempts` are persisted and reserved
-  for actually re-dispatching a failed ticket.
+- **Brain / planner** — phase 3 milestone B: split a request into tickets
+  with `depends_on`, then aggregate the results.
+- **Multi-daemon** — claims and leases are already atomic; a coordinator or
+  a shared watchdog would let several hosts drain one queue.
 - **License** — TBD (to be chosen before open-sourcing).
 
 ## Out of scope for the MVP
 
-Web UI, HTTP server, multi-user permissions, chat integrations, and a real
-retry/watchdog implementation.
+Web UI, HTTP server, multi-user permissions, chat integrations, and the
+planning brain (milestone B).

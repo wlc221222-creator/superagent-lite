@@ -44,8 +44,15 @@ class Ticket:
     ``attempts`` counts dispatches (1 for the first run), ``started_at`` is
     set when a dispatch begins and ``heartbeat_at`` is refreshed while the
     worker runs so that a restarted process can tell a live ticket from one
-    abandoned by a dead process.  ``retry_count`` / ``max_retries`` are
-    reserved for automatic retries.
+    abandoned by a dead process.  ``retry_count`` counts interruptions that
+    were put back on the queue; ``max_retries`` is how many of those a ticket
+    may suffer before it is failed instead.
+
+    ``claim_token`` identifies the current lease: a daemon sets a fresh token
+    when it atomically claims the ticket.  Results and heartbeats from an
+    execution are only accepted while the token still matches, so a stale
+    worker thread can never overwrite a ticket that was requeued and claimed
+    again.
     """
 
     id: str
@@ -62,6 +69,7 @@ class Ticket:
     attempts: int = 0
     retry_count: int = 0
     max_retries: int = 0
+    claim_token: str | None = None
     created_at: str = field(default_factory=utc_now)
     updated_at: str = field(default_factory=utc_now)
     started_at: str | None = None

@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import sys
 from pathlib import Path
 from typing import Sequence
 
 from .config import load_config
+from .daemon import Daemon, DaemonAlreadyRunning
 from .models import Ticket, TicketStatus
 from .router import Router
 
 STATUS_CHOICES = [status.value for status in TicketStatus]
+COMMANDS = ("run", "queue", "daemon", "list", "show")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,6 +47,51 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="timeout in seconds (default: config.timeout_seconds)",
+    )
+
+    queue = subparsers.add_parser(
+        "queue",
+        parents=[common],
+        help="create a pending ticket without executing it (superagentd runs it)",
+    )
+    queue.add_argument("task", nargs="+", help="task description (quote it)")
+    queue.add_argument(
+        "--worker",
+        default=None,
+        help="worker adapter: echo | claude | codex (default: config.default_worker)",
+    )
+    queue.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="timeout in seconds (default: config.timeout_seconds)",
+    )
+    queue.add_argument(
+        "--json", action="store_true", help="print machine-readable JSON"
+    )
+
+    daemon_cmd = subparsers.add_parser(
+        "daemon",
+        parents=[common],
+        help="run superagentd in the foreground (claims and executes queued tickets)",
+    )
+    daemon_cmd.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        help="worker pool size (default: config.daemon_concurrency)",
+    )
+    daemon_cmd.add_argument(
+        "--poll",
+        type=float,
+        default=None,
+        help="queue poll interval in seconds (default: config.daemon_poll_seconds)",
+    )
+    daemon_cmd.add_argument(
+        "--max-retries",
+        type=int,
+        default=None,
+        help="requeues allowed per interrupted ticket (default: config.max_retries)",
     )
 
     list_cmd = subparsers.add_parser(
@@ -81,7 +129,7 @@ def _hoist_global_config(argv: list[str]) -> list[str]:
 
     hoisted: list[str] = []
     rest: list[str] = []
-    commands = {"run", "list", "show"}
+    commands = set(COMMANDS)
     index = 0
     while index < len(argv):
         if argv[index] == "--config" and index + 1 < len(argv):
@@ -98,6 +146,10 @@ def _hoist_global_config(argv: list[str]) -> list[str]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
+    # Supervise a foreground daemon from a pipe (``daemon > out.log``) means
+    # block-buffered stdout; line buffering keeps the operator informed live.
+    with contextlib.suppress(Exception):
+        sys.stdout.reconfigure(line_buffering=True)
     raw = list(sys.argv[1:]) if argv is None else list(argv)
     args = parser.parse_args(_hoist_global_config(raw))
 
@@ -107,13 +159,40 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if args.command == "run" and args.timeout is not None:
+    if args.command in ("run", "queue") and args.timeout is not None:
         config["timeout_seconds"] = args.timeout
+
+    if args.command == "daemon":
+        if args.concurrency is not None and args.concurrency < 1:
+            print("error: --concurrency must be at least 1", file=sys.stderr)
+            return 2
+        if args.poll is not None and args.poll <= 0:
+            print("error: --poll must be greater than 0", file=sys.stderr)
+            return 2
+        if args.max_retries is not None and args.max_retries < 0:
+            print("error: --max-retries must be >= 0", file=sys.stderr)
+            return 2
+        daemon = Daemon(
+            config=config,
+            concurrency=args.concurrency,
+            poll_seconds=args.poll,
+            max_retries=args.max_retries,
+        )
+        try:
+            return daemon.run()
+        except DaemonAlreadyRunning as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        except (ValueError, KeyError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
     try:
         with Router(config=config) as router:
             if args.command == "run":
                 return _cmd_run(router, args)
+            if args.command == "queue":
+                return _cmd_queue(router, args)
             if args.command == "list":
                 return _cmd_list(router, args)
             if args.command == "show":
@@ -149,6 +228,26 @@ def _cmd_run(router: Router, args: argparse.Namespace) -> int:
     if ticket.error:
         print(f"error:   {ticket.error}")
     return 0 if ticket.status is TicketStatus.DONE else 1
+
+
+def _cmd_queue(router: Router, args: argparse.Namespace) -> int:
+    description = " ".join(args.task)
+    try:
+        ticket = router.enqueue(description, worker=args.worker)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(_ticket_dict(ticket), ensure_ascii=False, indent=2))
+        return 0
+    print(f"ticket:  {ticket.id}")
+    print(f"status:  {ticket.status.value}")
+    print(f"worker:  {ticket.worker}")
+    print(f"workdir: {ticket.workdir}")
+    print(f"log:     {ticket.log_path}")
+    print("queued:  waiting for superagentd (`python -m superagent_lite daemon`)")
+    return 0
 
 
 def _cmd_list(router: Router, args: argparse.Namespace) -> int:
@@ -237,6 +336,7 @@ def _ticket_dict(ticket: Ticket) -> dict[str, object]:
         "attempts": ticket.attempts,
         "retry_count": ticket.retry_count,
         "max_retries": ticket.max_retries,
+        "claim_token": ticket.claim_token,
         "created_at": ticket.created_at,
         "updated_at": ticket.updated_at,
         "started_at": ticket.started_at,

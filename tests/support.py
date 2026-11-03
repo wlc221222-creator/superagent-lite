@@ -17,6 +17,7 @@ Behaviour comes from stub_state.json next to this script; the argv and the
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 here = Path(__file__).resolve().parent
@@ -30,12 +31,31 @@ record = {
 }
 (here / "stub_record.json").write_text(json.dumps(record), encoding="utf-8")
 
+
+def track(event):
+    """Append one line to the shared tracker file, if the test asked for it."""
+    target = state.get("track")
+    if not target:
+        return
+    with open(target, "a", encoding="utf-8") as handle:
+        handle.write(event + "\n")
+        handle.flush()
+
+
 extra = state.get("stdout")
 if extra:
     print(extra)
 
 mode = state.get("mode", "success")
-if mode == "success":
+if mode == "sleep":
+    track("start " + os.getcwd())
+    time.sleep(float(state.get("sleep", 1.0)))
+    track("end " + os.getcwd())
+    Path("answer.txt").write_text(state.get("content", "chain-ok"), encoding="utf-8")
+    print("Wrote answer.txt into the working directory.")
+    print('RESULT {"status": "success", "summary": "created answer.txt", '
+          '"artifacts": ["answer.txt"]}')
+elif mode == "success":
     Path("answer.txt").write_text(state.get("content", "chain-ok"), encoding="utf-8")
     print("Wrote answer.txt into the working directory.")
     print('RESULT {"status": "success", "summary": "created answer.txt", '
@@ -105,3 +125,17 @@ def stub_record(directory: str | Path) -> dict:
 
 def python_executable() -> str:
     return sys.executable or "python3"
+
+
+def wait_for(predicate, timeout: float = 10.0, interval: float = 0.02):
+    """Poll ``predicate`` until it returns a truthy value or ``timeout``."""
+
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        _time.sleep(interval)
+    raise AssertionError(f"condition not met within {timeout:g}s: {predicate}")

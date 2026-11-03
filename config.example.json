@@ -31,6 +31,10 @@
   "timeout_seconds": 300,
   "stale_seconds": 300,
   "heartbeat_seconds": 15,
-  "max_attempts": 1,
+  "max_retries": 1,
+  "daemon_concurrency": 2,
+  "daemon_poll_seconds": 0.5,
+  "daemon_watchdog_seconds": 5,
+  "daemon_shutdown_grace_seconds": 30,
   "runtime_dir": "runtime"
 }

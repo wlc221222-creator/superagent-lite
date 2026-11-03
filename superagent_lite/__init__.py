@@ -1,6 +1,7 @@
 """superagent-lite: a local router/worker agent skeleton (MVP)."""
 
 from .config import default_config, load_config, resolve_claude_binary
+from .daemon import Daemon, DaemonAlreadyRunning
 from .models import Ticket, TicketStatus
 from .redact import sanitize_text
 from .result import (
@@ -20,6 +21,8 @@ __all__ = [
     "ClaudeCodeWorker",
     "CodexWorker",
     "ContractOutcome",
+    "Daemon",
+    "DaemonAlreadyRunning",
     "EchoWorker",
     "ResultContract",
     "Router",

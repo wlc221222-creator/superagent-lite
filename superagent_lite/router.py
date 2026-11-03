@@ -40,8 +40,13 @@ class Router:
         config: Mapping[str, Any] | None = None,
         store: TicketStore | str | Path | None = None,
         workers: Mapping[str, Worker] | None = None,
+        *,
+        recover_mode: str = "fail",
     ) -> None:
         self.config = normalize_config(dict(config)) if config is not None else default_config()
+        if recover_mode not in ("fail", "requeue"):
+            raise ValueError("recover_mode must be 'fail' or 'requeue'")
+        self.recover_mode = recover_mode
 
         self.runtime_dir = Path(self.config["runtime_dir"]).expanduser().resolve()
         self.work_dir = self.runtime_dir / "work"
@@ -53,14 +58,19 @@ class Router:
         if store is None:
             store = self.runtime_dir / "superagent.db"
         if isinstance(store, (str, Path)):
+            # Recovery is run explicitly below in the router's mode.
             store = TicketStore(
-                store, stale_seconds=float(self.config["stale_seconds"])
+                store,
+                stale_seconds=float(self.config["stale_seconds"]),
+                recover=False,
             )
         self.store = store
-        # A crashed previous process may have left tickets "running"; any
-        # ticket whose heartbeat went stale is failed here, with a log note.
+        # A crashed previous process may have left tickets "running".  The
+        # synchronous CLI fails them (iteration 2 behaviour); the daemon puts
+        # them back on the queue so its pool re-executes them.
         self.recovered = self.store.recover_stale_running(
-            stale_seconds=float(self.config["stale_seconds"])
+            stale_seconds=float(self.config["stale_seconds"]),
+            requeue=self.recover_mode == "requeue",
         )
 
         claude_binary = resolve_claude_binary(self.config)
@@ -83,8 +93,13 @@ class Router:
         self.workers = default_workers
 
     # -- public API -----------------------------------------------------
-    def submit(self, text: str, worker: str | Worker | None = None) -> Ticket:
-        """Create a ticket and dispatch it to a worker synchronously."""
+    def enqueue(self, text: str, worker: str | Worker | None = None) -> Ticket:
+        """Create a ``pending`` ticket and return it immediately.
+
+        The ticket is persisted for a daemon (or a later ``dispatch``) to
+        claim; nothing is executed here.  This is what ``superagent queue``
+        uses so the submitting side never waits for the run.
+        """
 
         description = (text or "").strip()
         if not description:
@@ -99,6 +114,7 @@ class Router:
             timeout=float(self.config["timeout_seconds"]),
             workdir=str(self.work_dir / ticket_id),
             log_path=str(self.log_dir / f"{ticket_id}.log"),
+            max_retries=int(self.config["max_retries"]),
         )
 
         Path(ticket.workdir).mkdir(parents=True, exist_ok=True)
@@ -112,50 +128,75 @@ class Router:
                     f"worker: {ticket.worker}",
                     f"workdir: {ticket.workdir}",
                     f"timeout: {ticket.timeout:g}s",
+                    "[router] queued (pending); awaiting a daemon",
                 ]
             )
             + "\n",
         )
-        return self.dispatch(ticket.id, worker=adapter)
+        return ticket
+
+    def submit(self, text: str, worker: str | Worker | None = None) -> Ticket:
+        """Create a ticket and dispatch it to a worker synchronously."""
+
+        ticket = self.enqueue(text, worker=worker)
+        return self.dispatch(ticket.id, worker=worker)
 
     def dispatch(self, ticket_id: str, worker: str | Worker | None = None) -> Ticket:
-        """Run an existing (typically pending) ticket through its worker."""
+        """Run an existing pending ticket through its worker.
+
+        The pending -> running transition is an atomic claim, so a daemon and
+        a synchronous ``submit`` can never execute the same ticket twice.
+        Every later write is conditional on the lease token claimed here.
+        """
 
         ticket = self.store.get(ticket_id)
         if ticket is None:
             raise KeyError(f"ticket not found: {ticket_id}")
 
         adapter = self._resolve_worker(worker if worker is not None else ticket.worker)
-        started_at = utc_now()
-        ticket = self.store.set_status(
-            ticket.id,
-            TicketStatus.RUNNING,
-            started_at=started_at,
-            heartbeat_at=started_at,
-            attempts=ticket.attempts + 1,
-            worker=adapter.name,
-            error=None,
-            exit_code=None,
-            finished_at=None,
-        )
+        ticket = self.store.claim(ticket_id)
+        if ticket is None:
+            # Already running, done, or claimed by a daemon.  Return the
+            # current row untouched rather than executing it a second time.
+            return self.store.get(ticket_id)  # type: ignore[return-value]
+
         append_log(
             ticket.log_path,
             f"[{ticket.started_at}] started with {adapter.name} "
             f"(attempt {ticket.attempts})\n",
         )
+        return self.run_claimed(adapter, ticket)
 
-        started = time.monotonic()
-        heartbeat = _Heartbeat(
-            self._make_heartbeat(ticket), float(self.config["heartbeat_seconds"])
+    def run_claimed(self, adapter: Worker, ticket: Ticket) -> Ticket:
+        """Execute a ticket whose lease this process already holds.
+
+        Shared by the synchronous :meth:`dispatch` and the daemon worker pool:
+        both pass a ticket that ``TicketStore.claim*`` returned running and
+        carrying a ``claim_token``.  The token guards every write, so if the
+        lease is lost mid-run (watchdog requeue) the late result is discarded
+        instead of clobbering the ticket.
+        """
+
+        token = ticket.claim_token
+        append_log(
+            ticket.log_path,
+            f"[{utc_now()}] [router] claimed lease {token} "
+            f"(worker={adapter.name})\n",
         )
+        started = time.monotonic()
+        heartbeat = self._make_heartbeat(ticket, token)
         heartbeat.start()
         try:
-            result = self._run_worker(adapter, ticket, Path(ticket.workdir), heartbeat)
+            result = self._run_worker(
+                adapter, ticket, Path(ticket.workdir), heartbeat
+            )
         except KeyboardInterrupt:
-            self._fail(ticket.id, "interrupted by user", started)
+            self._fail(ticket.id, "interrupted by user", started, token=token)
             raise
         except BaseException as exc:  # noqa: BLE001 - every failure must be recorded
-            self._fail(ticket.id, f"{type(exc).__name__}: {exc}", started)
+            self._fail(
+                ticket.id, f"{type(exc).__name__}: {exc}", started, token=token
+            )
             if isinstance(exc, SystemExit):
                 raise
             return self.store.get(ticket.id)  # type: ignore[return-value]
@@ -167,9 +208,10 @@ class Router:
         outcome = self._judge(adapter, result, Path(ticket.workdir))
 
         if outcome.success:
-            ticket = self.store.set_status(
+            updated = self.store.set_status(
                 ticket.id,
                 TicketStatus.DONE,
+                expected_claim_token=token,
                 result_summary=_clip(outcome.summary or result.summary, MAX_SUMMARY_CHARS),
                 artifacts=outcome.artifacts[:MAX_ARTIFACTS],
                 error=None,
@@ -177,9 +219,10 @@ class Router:
                 finished_at=finished_at,
             )
         else:
-            ticket = self.store.set_status(
+            updated = self.store.set_status(
                 ticket.id,
                 TicketStatus.FAILED,
+                expected_claim_token=token,
                 result_summary=_clip(outcome.summary or result.summary, MAX_SUMMARY_CHARS) or None,
                 artifacts=outcome.artifacts[:MAX_ARTIFACTS],
                 error=_clip(outcome.error or "worker reported failure", MAX_SUMMARY_CHARS),
@@ -187,19 +230,27 @@ class Router:
                 finished_at=finished_at,
             )
 
+        if updated is None:
+            append_log(
+                ticket.log_path,
+                f"[{finished_at}] [router] lease {token} was lost; discarding "
+                f"late result (success={outcome.success})\n",
+            )
+            return self.store.get(ticket.id)  # type: ignore[return-value]
+
         append_log(
-            ticket.log_path,
+            updated.log_path,
             "\n".join(
                 [
-                    f"[{finished_at}] finished status={ticket.status.value} "
+                    f"[{finished_at}] finished status={updated.status.value} "
                     f"elapsed={duration:.2f}s",
-                    f"[router] artifacts={len(ticket.artifacts)}"
-                    + (f" {ticket.artifacts}" if ticket.artifacts else ""),
+                    f"[router] artifacts={len(updated.artifacts)}"
+                    + (f" {updated.artifacts}" if updated.artifacts else ""),
                 ]
             )
             + "\n",
         )
-        return ticket
+        return updated
 
     def get(self, ticket_id: str) -> Ticket | None:
         """Return a ticket, or ``None`` when the id is unknown."""
@@ -239,17 +290,19 @@ class Router:
             raise ValueError(f"unknown worker {name!r}; available workers: {known}")
         return adapter
 
-    def _make_heartbeat(self, ticket: Ticket) -> Callable[[], None]:
-        """Return a callback that refreshes the ticket's ``heartbeat_at``."""
+    def _make_heartbeat(
+        self, ticket: Ticket, token: str | None = None
+    ) -> "_Heartbeat":
+        """Return a lease-checked heartbeat ticker for ``ticket``."""
 
         def heartbeat() -> None:
             try:
-                if self.store.heartbeat(ticket.id) is not None:
+                if self.store.heartbeat(ticket.id, claim_token=token) is not None:
                     append_log(ticket.log_path, f"[{utc_now()}] [router] heartbeat\n")
             except Exception:  # pragma: no cover - never kill a run over a tick
                 pass
 
-        return heartbeat
+        return _Heartbeat(heartbeat, float(self.config["heartbeat_seconds"]))
 
     def _run_worker(
         self,
@@ -304,15 +357,20 @@ class Router:
         outcome.artifacts = artifacts
         return outcome
 
-    def _fail(self, ticket_id: str, error: str, started: float) -> None:
+    def _fail(
+        self, ticket_id: str, error: str, started: float, *, token: str | None = None
+    ) -> None:
         finished_at = utc_now()
         try:
             ticket = self.store.set_status(
                 ticket_id,
                 TicketStatus.FAILED,
+                expected_claim_token=token,
                 error=_clip(error, MAX_SUMMARY_CHARS),
                 finished_at=finished_at,
             )
+            if ticket is None:
+                return
             append_log(
                 ticket.log_path,
                 f"[{finished_at}] failed after {time.monotonic() - started:.2f}s: {error}\n",
