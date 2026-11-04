@@ -33,6 +33,11 @@ public final class ApiClient {
         void onError(String message, String detail);
     }
 
+    /** Receives /chat/stream events on the background thread running the call. */
+    public interface StreamListener {
+        void onEvent(String type, JSONObject event);
+    }
+
     public static final class Ticket {
         public final String id;
         public final String description;
@@ -98,6 +103,30 @@ public final class ApiClient {
                 JSONObject json = request("POST", "/chat", body, true, 600000);
                 String reply = json.optString("reply", "");
                 post(() -> cb.onSuccess(reply.isEmpty() ? "（主智能体没有返回内容）" : reply));
+            } catch (ApiError e) {
+                post(() -> cb.onError(e.getMessage(), e.detail));
+            } catch (Exception e) {
+                post(() -> cb.onError("消息组织失败", String.valueOf(e)));
+            }
+        });
+    }
+
+    /**
+     * Chat through /chat/stream. {@link StreamListener#onEvent} fires on the
+     * executor thread as each SSE event arrives; the callback fires on the
+     * main thread with the final done/error event. If the stream fails
+     * before any event, the callback's error carries the failure and the
+     * caller may retry with {@link #chat}.
+     */
+    public void chatStream(String text, StreamListener listener, Callback<JSONObject> cb) {
+        executor.execute(() -> {
+            try {
+                JSONObject body = new JSONObject();
+                body.put("text", text);
+                body.put("user_id", "android");
+                // A stream stays open for the whole task: allow 10 min.
+                JSONObject last = stream("/chat/stream", body, listener);
+                post(() -> cb.onSuccess(last));
             } catch (ApiError e) {
                 post(() -> cb.onError(e.getMessage(), e.detail));
             } catch (Exception e) {
@@ -208,6 +237,117 @@ public final class ApiClient {
         } finally {
             if (conn != null) conn.disconnect();
         }
+    }
+
+    /**
+     * POST an SSE endpoint line by line, feeding every {@code data: {...}}
+     * event to the listener. Returns the final done/error event. A non-2xx
+     * status or a stream that ends without a final event is an {@link ApiError}.
+     */
+    private JSONObject stream(String path, JSONObject body, StreamListener listener) throws ApiError {
+        if (baseUrl.isEmpty()) {
+            throw new ApiError("还没有设置服务器地址", "base_url is empty");
+        }
+        HttpURLConnection conn = null;
+        try {
+            String url = baseUrl.replaceAll("/+$", "") + path;
+            conn = (HttpURLConnection) new URL(url).openConnection();
+            conn.setRequestMethod("POST");
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(600000);
+            conn.setRequestProperty("Accept", "text/event-stream");
+            if (!token.isEmpty()) {
+                conn.setRequestProperty("Authorization", "Bearer " + token);
+            }
+            conn.setDoOutput(true);
+            conn.setRequestProperty("Content-Type", "application/json; charset=utf-8");
+            byte[] bytes = body.toString().getBytes(StandardCharsets.UTF_8);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(bytes);
+            }
+            int code = conn.getResponseCode();
+            if (code < 200 || code >= 300) {
+                // Same error surface as request(): read the body for detail.
+                String text = readAll(conn.getErrorStream());
+                String serverError = "";
+                try {
+                    JSONObject json = text.isEmpty() ? new JSONObject() : new JSONObject(text);
+                    serverError = json.optString("error", "");
+                    if (serverError.isEmpty()) serverError = json.optString("reply", "");
+                } catch (Exception ignored) {
+                    // Non-JSON error body: the generic message below is fine.
+                }
+                if (code == 401) {
+                    throw new ApiError("访问令牌不正确，请在设置里检查", "HTTP 401: " + text);
+                }
+                throw new ApiError(
+                        serverError.isEmpty() ? "服务器返回了错误" : "服务器：" + serverError,
+                        "HTTP " + code + ": " + text);
+            }
+
+            JSONObject last = null;
+            String eventName = null;
+            StringBuilder data = new StringBuilder();
+            try (BufferedReader reader = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    if (line.isEmpty()) {
+                        JSONObject event = dispatchEvent(eventName, data.toString());
+                        eventName = null;
+                        data.setLength(0);
+                        if (event == null) continue;
+                        listener.onEvent(event.optString("type", ""), event);
+                        if (isFinalEvent(event)) {
+                            last = event;
+                            break;
+                        }
+                        continue;
+                    }
+                    if (line.startsWith(":")) continue; // SSE comment / keep-alive
+                    if (line.startsWith("event:")) {
+                        eventName = line.substring(6).trim();
+                    } else if (line.startsWith("data:")) {
+                        if (data.length() > 0) data.append('\n');
+                        data.append(line.substring(5).trim());
+                    }
+                    // id:/retry: fields are irrelevant here.
+                }
+            }
+            if (last == null) {
+                throw new ApiError("连接中断，没有收到完整回复", "stream ended without a done event");
+            }
+            return last;
+        } catch (ApiError e) {
+            throw e;
+        } catch (Exception e) {
+            throw new ApiError("连接不上服务器，请检查地址和网络", String.valueOf(e));
+        } finally {
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    /**
+     * Build an event object from one SSE frame. The event type normally
+     * rides inside the JSON ({@code "type"}), but fall back to the SSE
+     * {@code event:} field if the payload omits it.
+     */
+    private static JSONObject dispatchEvent(String eventName, String data) {
+        if (data.isEmpty()) return null;
+        try {
+            JSONObject event = new JSONObject(data);
+            if (event.optString("type", "").isEmpty() && eventName != null) {
+                event.put("type", eventName);
+            }
+            return event;
+        } catch (Exception e) {
+            return null; // malformed frame; keep reading
+        }
+    }
+
+    private static boolean isFinalEvent(JSONObject event) {
+        String type = event.optString("type", "");
+        return "done".equals(type) || "error".equals(type);
     }
 
     private static String readAll(InputStream stream) throws Exception {

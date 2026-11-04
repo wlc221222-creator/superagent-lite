@@ -14,6 +14,9 @@ import android.widget.ListView;
 import android.widget.TextView;
 import android.widget.Toast;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
 import java.util.ArrayList;
 import java.util.List;
 
@@ -33,9 +36,13 @@ public final class MainActivity extends Activity {
     private MessageAdapter adapter;
     private EditText input;
     private Button sendButton;
+    private TextView streamStatus;
     private ApiClient api;
     private boolean sending = false;
     private boolean settingsPrompted = false;
+    // Events arrive on the ApiClient executor; the flag tells the main
+    // thread whether a fallback retry is still possible.
+    private volatile boolean streamSawEvent = false;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -47,6 +54,7 @@ public final class MainActivity extends Activity {
         list.setAdapter(adapter);
         input = findViewById(R.id.input);
         sendButton = findViewById(R.id.send);
+        streamStatus = findViewById(R.id.stream_status);
         sendButton.setOnClickListener(v -> send());
     }
 
@@ -100,7 +108,48 @@ public final class MainActivity extends Activity {
         adapter.notifyDataSetChanged();
         sending = true;
         sendButton.setEnabled(false);
+        streamSawEvent = false;
+        setStreamStatus("");
 
+        api.chatStream(text, new ApiClient.StreamListener() {
+            @Override
+            public void onEvent(String type, JSONObject event) {
+                streamSawEvent = true;
+                runOnUiThread(() -> showStreamEvent(type, event));
+            }
+        }, new ApiClient.Callback<JSONObject>() {
+            @Override
+            public void onSuccess(JSONObject event) {
+                setStreamStatus("");
+                final String reply = event.optString("reply", "");
+                if ("error".equals(event.optString("type", ""))) {
+                    pending.text = reply.isEmpty() ? "服务器返回了错误" : reply;
+                    finishSend();
+                    return;
+                }
+                pending.text = reply.isEmpty() ? "（主智能体没有返回内容）" : reply;
+                finishSend();
+            }
+
+            @Override
+            public void onError(String message, String detail) {
+                setStreamStatus("");
+                if (streamSawEvent) {
+                    // The stream died mid-flight: report it where the reply goes.
+                    pending.text = message + "\n（详情：" + detail + "）";
+                    finishSend();
+                    return;
+                }
+                // Nothing arrived (old server, proxy blocking SSE): use /chat.
+                pending.text = "主智能体处理中…";
+                adapter.notifyDataSetChanged();
+                fallbackChat(text, pending);
+            }
+        });
+    }
+
+    /** Retry through the blocking /chat endpoint when the stream never started. */
+    private void fallbackChat(String text, Message pending) {
         api.chat(text, new ApiClient.Callback<String>() {
             @Override
             public void onSuccess(String reply) {
@@ -114,6 +163,61 @@ public final class MainActivity extends Activity {
                 finishSend();
             }
         });
+    }
+
+    /** One quiet line above the composer, mirroring the server's progress. */
+    private void showStreamEvent(String type, JSONObject event) {
+        switch (type) {
+            case "accepted":
+                setStreamStatus("已收到");
+                break;
+            case "planning":
+                setStreamStatus("正在规划…");
+                break;
+            case "tickets":
+                setStreamStatus("已派单 " + ticketCount(event) + " 张");
+                break;
+            case "ticket": {
+                String id = event.optString("id", "");
+                String shortId = id.length() > 8 ? id.substring(0, 8) : id;
+                setStreamStatus("工单 #" + shortId + " " + statusLabel(event.optString("status", "")));
+                break;
+            }
+            case "done":
+                setStreamStatus("");
+                break;
+            default:
+                // error and anything unknown: the callback clears the line.
+                break;
+        }
+    }
+
+    private static int ticketCount(JSONObject event) {
+        JSONArray ids = event.optJSONArray("ticket_ids");
+        if (ids != null) return ids.length();
+        return event.optInt("count", 0);
+    }
+
+    private static String statusLabel(String status) {
+        switch (status) {
+            case "pending": return "排队中";
+            case "running": return "执行中";
+            case "awaiting_approval": return "等待你批准";
+            case "needs_attention": return "需要你关注";
+            case "done": return "已完成";
+            case "failed": return "失败";
+            default: return status;
+        }
+    }
+
+    private void setStreamStatus(String text) {
+        if (streamStatus == null) return;
+        if (text.isEmpty()) {
+            streamStatus.setVisibility(View.GONE);
+        } else {
+            streamStatus.setText(text);
+            streamStatus.setVisibility(View.VISIBLE);
+        }
     }
 
     private void finishSend() {
