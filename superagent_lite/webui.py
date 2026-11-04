@@ -4,7 +4,10 @@ No build step, no CDN, no external resource: one HTML document with inline
 CSS and vanilla JavaScript.  It talks to the same token-authenticated API as
 every other client:
 
-* ``POST /chat`` with the message;
+* ``POST /chat/stream`` with the message, read as server-sent events so one
+  quiet status line can follow planning and ticket progress live.  If the
+  streaming request fails before the first event, the page falls back to the
+  original ``POST /chat`` path;
 * ``GET  /tickets/<id>`` to poll progress after a ticket was queued;
 * ``GET  /attention`` for the read-only "needs attention" list (tickets
   awaiting approval and tickets whose semantic review was inconclusive);
@@ -96,6 +99,9 @@ CHAT_PAGE = """<!doctype html>
                  text-decoration: underline; font-size: 13px; }
   .msg.user .artifacts a { color: #fff; }
   .error { color: var(--bad); }
+  /* One quiet line of 12px muted text that follows a streaming reply. */
+  .status { margin: 2px 0 6px 2px; font-size: 12px; color: var(--muted);
+            align-self: flex-start; }
   .state-awaiting_approval { color: var(--warn); font-weight: 600; }
   .attention { margin: 8px 16px 0; padding: 14px 16px; border: 0.5px solid var(--line);
                border-radius: 16px; background: var(--panel); font-size: 13px; }
@@ -356,6 +362,123 @@ CHAT_PAGE = """<!doctype html>
     tick();
   }
 
+  function finishAnswer(data) {
+    var answer = bubble("agent", data.reply || "(empty reply)");
+    var meta = answer.querySelector(".meta");
+    var bits = ["mode: " + (data.mode || "?")];
+    if (data.model) { bits.push("model: " + data.model); }
+    if (data.timed_out) { bits.push("仍有工单在执行"); }
+    meta.textContent = "agent · " + bits.join(" · ");
+    var ids = data.ticket_ids || [];
+    if (ids.length) {
+      var idLine = document.createElement("div");
+      idLine.className = "meta";
+      idLine.textContent = "tickets: " + ids.join(", ");
+      answer.insertBefore(idLine, answer.querySelector(".body").nextSibling);
+      pollTickets(answer, ids);
+    }
+    return answer;
+  }
+
+  function showFailure(message) {
+    var failed = bubble("agent", message);
+    failed.querySelector(".meta").textContent = "agent · error";
+    return failed;
+  }
+
+  function statusLabel(status) {
+    if (status === "running") { return "进行中"; }
+    if (status === "done") { return "已完成"; }
+    if (status === "failed") { return "失败"; }
+    if (status === "awaiting_approval") { return "等待审批中…"; }
+    if (status === "pending") { return "排队中"; }
+    return status || "未知";
+  }
+
+  function statusText(event) {
+    if (event.type === "accepted") { return "已收到"; }
+    if (event.type === "planning") { return "正在规划…"; }
+    if (event.type === "tickets") {
+      return "已派单 " + ((event.ticket_ids || []).length) + " 张";
+    }
+    if (event.type === "ticket") {
+      if (event.status === "awaiting_approval") { return "等待审批中…"; }
+      return "工单 #" + event.id + "：" + statusLabel(event.status);
+    }
+    return "";
+  }
+
+  // POST /chat/stream, parsed as SSE.  Events go to onEvent; the promise
+  // resolves when the stream closes.  A failure *before the first event*
+  // rejects with error.beforeFirstEvent so the caller can fall back to /chat.
+  function streamChat(text, onEvent) {
+    var options = {
+      method: "POST",
+      headers: headers(),
+      body: JSON.stringify({ text: text, user_id: "web" })
+    };
+    return fetch("/chat/stream", options).then(function (response) {
+      if (!response.ok) {
+        return response.text().then(function (raw) {
+          var message = "HTTP " + response.status;
+          try {
+            var data = raw ? JSON.parse(raw) : null;
+            if (data && data.error) { message = data.error; }
+          } catch (e) { /* not JSON */ }
+          var failure = new Error(message);
+          failure.beforeFirstEvent = true;
+          throw failure;
+        });
+      }
+      if (!response.body || !response.body.getReader) {
+        var unsupported = new Error("streaming is not supported");
+        unsupported.beforeFirstEvent = true;
+        throw unsupported;
+      }
+      var reader = response.body.getReader();
+      var decoder = new TextDecoder("utf-8");
+      var buffer = "";
+      var sawEvent = false;
+      var finished = false;
+
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) {
+            if (!sawEvent) {
+              var empty = new Error("empty stream");
+              empty.beforeFirstEvent = true;
+              throw empty;
+            }
+            return null;
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var blocks = buffer.split("\\n\\n");
+          buffer = blocks.pop();
+          blocks.forEach(function (block) {
+            block.split("\\n").forEach(function (line) {
+              if (line.slice(-1) === "\\r") { line = line.slice(0, -1); }
+              // ": ping" comments and blank lines are ignored.
+              if (line.indexOf("data:") !== 0) { return; }
+              var payload = line.slice(5).trim();
+              if (!payload) { return; }
+              var event = null;
+              try { event = JSON.parse(payload); } catch (e) { return; }
+              if (!event || !event.type) { return; }
+              sawEvent = true;
+              onEvent(event);
+              if (event.type === "done" || event.type === "error") {
+                finished = true;
+              }
+            });
+          });
+          if (finished) { return null; }
+          return pump();
+        });
+      }
+      return pump();
+    });
+  }
+
   function send() {
     var text = messageEl.value.trim();
     if (!text) { return; }
@@ -365,36 +488,54 @@ CHAT_PAGE = """<!doctype html>
     bubble("user", text);
     messageEl.value = "";
     setBusy(true);
-    var pending = bubble("agent", "…");
 
-    api("/chat", {
-      method: "POST",
-      body: JSON.stringify({ text: text, user_id: "web" })
-    }).then(function (data) {
-      pending.remove();
-      var answer = bubble("agent", data.reply || "(empty reply)");
-      var meta = answer.querySelector(".meta");
-      var bits = ["mode: " + (data.mode || "?")];
-      if (data.model) { bits.push("model: " + data.model); }
-      if (data.timed_out) { bits.push("仍有工单在执行"); }
-      meta.textContent = "agent · " + bits.join(" · ");
-      var ids = data.ticket_ids || [];
-      if (ids.length) {
-        var idLine = document.createElement("div");
-        idLine.className = "meta";
-        idLine.textContent = "tickets: " + ids.join(", ");
-        answer.insertBefore(idLine, answer.querySelector(".body").nextSibling);
-        pollTickets(answer, ids);
-      }
-    }).catch(function (error) {
-      pending.remove();
-      var failed = bubble("agent", "请求失败：" + error.message);
-      failed.querySelector(".meta").textContent = "agent · error";
-    }).then(function () {
+    var statusEl = document.createElement("div");
+    statusEl.className = "status";
+    statusEl.textContent = "已收到";
+    logEl.appendChild(statusEl);
+    statusEl.scrollIntoView({ block: "end" });
+
+    var finalData = null;
+    var finalError = null;
+
+    function clearStatus() {
+      if (statusEl.parentNode) { statusEl.parentNode.removeChild(statusEl); }
+    }
+
+    function settle() {
+      clearStatus();
       setBusy(false);
       messageEl.focus();
       refreshAttention();
-    });
+    }
+
+    streamChat(text, function (event) {
+      if (event.type === "done") { finalData = event; return; }
+      if (event.type === "error") { finalError = event; return; }
+      var line = statusText(event);
+      if (line) { statusEl.textContent = line; }
+    }).then(function () {
+      clearStatus();
+      if (finalData) { finishAnswer(finalData); return; }
+      if (finalError) { showFailure(finalError.reply || "请求失败"); return; }
+      showFailure("连接中断，回复可能未完成。");
+    }, function (error) {
+      if (error && error.beforeFirstEvent) {
+        // Nothing was streamed yet: use the original blocking endpoint.
+        var pending = bubble("agent", "…");
+        return api("/chat", {
+          method: "POST",
+          body: JSON.stringify({ text: text, user_id: "web" })
+        }).then(function (data) {
+          pending.remove();
+          finishAnswer(data);
+        }, function (fallbackError) {
+          pending.remove();
+          showFailure("请求失败：" + fallbackError.message);
+        });
+      }
+      showFailure("请求失败：" + error.message);
+    }).then(settle);
   }
 
   sendEl.addEventListener("click", send);

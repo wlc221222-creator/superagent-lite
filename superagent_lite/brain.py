@@ -21,7 +21,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from .config import default_config, normalize_config
 from .memory import read_memory
@@ -57,6 +57,26 @@ class CompletionFn(Protocol):
         max_tokens: int = 2048,
         temperature: float | None = None,
     ) -> str: ...
+
+
+#: One progress event for a streaming client.  The dicts are the SSE payloads
+#: documented on ``POST /chat/stream``; the brain only produces them.
+EventCallback = Callable[[dict[str, Any]], None]
+
+
+def _emit(on_event: EventCallback | None, event: dict[str, Any]) -> None:
+    """Deliver one event, swallowing callback errors.
+
+    Streaming is a progress channel, never a reason for a chat to fail: a
+    client that has gone away must not take the reply down with it.
+    """
+
+    if on_event is None:
+        return
+    try:
+        on_event(event)
+    except Exception:  # noqa: BLE001 - a broken callback must not break chat
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -159,15 +179,24 @@ class Brain:
         *,
         user_id: str = "local",
         timeout: float | None = None,
+        on_event: EventCallback | None = None,
     ) -> ChatReply:
         """Handle one user message end to end.
 
         Never raises for planner/endpoint problems: those come back as a
         ``MODE_ERROR`` reply so a REPL or HTTP client always gets an answer.
+
+        ``on_event``, when given, receives progress dicts for a streaming
+        client (``planning`` / ``tickets`` / ``ticket`` / ``done``, see
+        :mod:`superagent_lite.http_api`).  Callback failures are ignored:
+        progress reporting must never be able to break the chat.
         """
 
-        answer = self._reply(text, user_id=user_id, timeout=timeout)
+        answer = self._reply(
+            text, user_id=user_id, timeout=timeout, on_event=on_event
+        )
         self._remember(user_id, text, answer)
+        _emit(on_event, {"type": "done", **answer.to_dict()})
         return answer
 
     def _reply(
@@ -176,11 +205,13 @@ class Brain:
         *,
         user_id: str,
         timeout: float | None,
+        on_event: EventCallback | None = None,
     ) -> ChatReply:
         text = (text or "").strip()
         if not text:
             return ChatReply(text="(empty message)", mode=MODE_ERROR)
 
+        _emit(on_event, {"type": "planning"})
         try:
             plan = self.plan(text, user_id=user_id)
         except PlannerError as exc:
@@ -204,8 +235,14 @@ class Brain:
                 mode=MODE_ERROR,
             )
 
+        _emit(
+            on_event,
+            {"type": "tickets", "ticket_ids": [ticket.id for ticket in tickets]},
+        )
         wait = float(self.config["chat_timeout_seconds"] if timeout is None else timeout)
-        finished, timed_out = self.wait(tickets, timeout=wait)
+        finished, timed_out = self.wait(
+            tickets, timeout=wait, on_event=on_event
+        )
         ids = [ticket.id for ticket in tickets]
 
         if timed_out:
@@ -327,20 +364,43 @@ class Brain:
             tickets.append(ticket)
         return tickets
 
-    def wait(self, tickets: Sequence[Ticket], *, timeout: float) -> tuple[list[Ticket], bool]:
+    def wait(
+        self,
+        tickets: Sequence[Ticket],
+        *,
+        timeout: float,
+        on_event: EventCallback | None = None,
+    ) -> tuple[list[Ticket], bool]:
         """Poll until every ticket is settled for this reply or ``timeout`` expires.
 
         ``awaiting_approval`` is terminal-for-this-reply (Revision 2 / phase 5
         §2): the ticket waits for an operator, so the chat must answer now
         saying so instead of polling until the deadline.
+
+        With ``on_event``, each status *change* seen while polling becomes one
+        ``ticket`` event; an unchanged poll emits nothing.
         """
 
         deadline = time.monotonic() + max(0.0, float(timeout))
         interval = max(0.01, float(self.config["chat_poll_seconds"]))
+        seen: dict[str, TicketStatus | None] = {
+            ticket.id: ticket.status for ticket in tickets
+        }
         while True:
             current = [
                 self.router.get(ticket.id) or ticket for ticket in tickets
             ]
+            for ticket in current:
+                if seen.get(ticket.id) != ticket.status:
+                    seen[ticket.id] = ticket.status
+                    _emit(
+                        on_event,
+                        {
+                            "type": "ticket",
+                            "id": ticket.id,
+                            "status": ticket.status.value,
+                        },
+                    )
             if all(_settled(ticket) for ticket in current):
                 return current, False
             if time.monotonic() >= deadline:

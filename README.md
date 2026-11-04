@@ -129,6 +129,9 @@ user sentence
 - **Waiting** -- `chat`/`POST /chat` poll the tickets for
   `chat_timeout_seconds`; if they are not all terminal in time, the reply
   lists the ticket ids (and their statuses) so the caller can ask again.
+  `POST /chat/stream` runs the same chat and reports progress as server-sent
+  events (`accepted` -> `planning` -> `tickets` -> `ticket` per status change
+  -> `done`, or `error`), which is what the web page shows in its status line.
 - **Summary** -- the planner model receives the workers' *structured* results
   (status, summary, artifacts, error as JSON) and writes the final answer. It
   is told not to claim success the ticket data does not show; a failed ticket
@@ -178,6 +181,7 @@ or a reply. Only the model name is configurable:
 | --- | --- |
 | `GET /` | the single-file web chat UI (public; no external resources) |
 | `POST /chat` `{"text": "...", "user_id": "..."}` | `{"reply", "mode", "ticket_ids", "timed_out", "model"}`; `mode` is `reply` / `summary` / `pending` (timeout) / `error` (502) |
+| `POST /chat/stream` (same body/auth) | `text/event-stream` of `data: {json}` events: `accepted`, `planning`, `tickets`, `ticket` (status change), then `done` (same fields as `/chat`) or `error`; `: ping` comments every 15 s |
 | `GET /tickets/<id>` | the ticket, including `status`, `artifacts`, `result_summary`, `depends_on` |
 | `GET /tickets/<id>/artifacts` | `{"ticket_id", "artifacts": [{"name", "size", "exists", "url"}]}` |
 | `GET /tickets/<id>/artifacts/<name>` | the artifact bytes, with a guessed `Content-Type` and `Content-Disposition: attachment` |

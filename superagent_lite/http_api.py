@@ -8,6 +8,11 @@ Endpoints
                     reply.  Waits for the request's tickets up to
                     ``chat_timeout_seconds``; on timeout it answers with
                     ``mode: "pending"`` and the ticket ids instead.
+``POST /chat/stream``  the same request body and auth, answered as
+                    ``text/event-stream``: ``accepted``, ``planning``,
+                    ``tickets``, one ``ticket`` per status change while
+                    waiting, then ``done`` (or ``error``).  ``: ping``
+                    comments keep the connection alive while a plan runs.
 ``GET  /tickets/<id>``  one ticket's state and structured result.
 ``GET  /tickets/<id>/artifacts``  ``{"ticket_id", "artifacts": [...]}`` -- the
                     files the ticket recorded, with size and URL.
@@ -45,7 +50,9 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import queue
 import re
+import threading
 from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -79,6 +86,9 @@ _APPROVE_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/approve/?$")
 _REJECT_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/reject/?$")
 
 FEISHU_PATH = "/channels/feishu"
+
+#: Seconds between ``: ping`` comment lines while a stream is idle.
+STREAM_HEARTBEAT_SECONDS = 15.0
 
 
 
@@ -192,6 +202,11 @@ class _Handler(BaseHTTPRequestHandler):
                 (approve or reject).group("id"), approve=bool(approve)
             )
             return
+        if path in ("/chat/stream", "/chat/stream/"):
+            if not self._authorized():
+                return
+            self._handle_chat_stream()
+            return
         if path not in ("/chat", "/chat/"):
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -240,6 +255,95 @@ class _Handler(BaseHTTPRequestHandler):
             {"error": "unauthorized"},
         )
         return False
+
+    # -- streaming chat -------------------------------------------------
+    def _handle_chat_stream(self) -> None:
+        """``POST /chat/stream``: one SSE event per progress step.
+
+        The brain call runs in a worker thread so this handler can keep the
+        socket alive with ``: ping`` comments while planning or waiting takes
+        time.  Everything except the initial request validation is delivered
+        inside the stream: once ``200 text/event-stream`` is on the wire even a
+        planning failure becomes an ``error`` event, not an HTTP error.
+        """
+
+        payload = self._read_json()
+        if payload is None:
+            return
+        text = payload.get("text")
+        if not isinstance(text, str) or not text.strip():
+            self._send_json(
+                HTTPStatus.BAD_REQUEST, {"error": "field 'text' must be a non-empty string"}
+            )
+            return
+        user_id = payload.get("user_id", "http")
+        if not isinstance(user_id, str) or not user_id.strip():
+            user_id = "http"
+
+        events: queue.Queue[dict[str, Any] | None] = queue.Queue()
+
+        def on_event(event: dict[str, Any]) -> None:
+            # On /chat a mode=error reply is a 502; a stream that already
+            # started reports the same thing as an ``error`` event instead.
+            if event.get("type") == "done" and event.get("mode") == "error":
+                return
+            events.put(event)
+
+        def run() -> None:
+            try:
+                result = self.server.brain.reply(
+                    text, user_id=user_id, on_event=on_event
+                )
+                if result.mode == "error":
+                    events.put(
+                        {"type": "error", "reply": result.text, "mode": "error"}
+                    )
+            except Exception as exc:  # noqa: BLE001 - reported inside the stream
+                events.put(
+                    {
+                        "type": "error",
+                        "reply": f"{type(exc).__name__}: {exc}",
+                        "mode": "error",
+                    }
+                )
+            finally:
+                events.put(None)  # sentinel: the producer is finished
+
+        worker = threading.Thread(
+            target=run, name="chat-stream", daemon=True
+        )
+        worker.start()
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+
+        try:
+            self._write_event({"type": "accepted"})
+            while True:
+                try:
+                    event = events.get(timeout=STREAM_HEARTBEAT_SECONDS)
+                except queue.Empty:
+                    self.wfile.write(b": ping\n\n")
+                    self.wfile.flush()
+                    continue
+                if event is None:
+                    break
+                self._write_event(event)
+                if event.get("type") in ("done", "error"):
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            # The client hung up; the brain thread finishes on its own.
+            return
+
+    def _write_event(self, event: Mapping[str, Any]) -> None:
+        line = json.dumps(event, ensure_ascii=False)
+        self.wfile.write(f"data: {line}\n\n".encode("utf-8"))
+        self.wfile.flush()
 
     # -- approval gate --------------------------------------------------
     def _handle_approval(self, ticket_id: str, *, approve: bool) -> None:
