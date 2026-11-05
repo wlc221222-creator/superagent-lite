@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS tickets (
     review_reasons TEXT,
     review_attempts INTEGER NOT NULL DEFAULT 0,
     approval_hash  TEXT,
+    task_id        TEXT,
     created_at     TEXT NOT NULL,
     updated_at     TEXT NOT NULL,
     started_at     TEXT,
@@ -69,6 +70,7 @@ FIELDS: tuple[str, ...] = (
     "review_reasons",
     "review_attempts",
     "approval_hash",
+    "task_id",
     "created_at",
     "updated_at",
     "started_at",
@@ -90,6 +92,7 @@ _ADDED_COLUMNS: dict[str, str] = {
     "review_reasons": "TEXT",
     "review_attempts": "INTEGER NOT NULL DEFAULT 0",
     "approval_hash": "TEXT",
+    "task_id": "TEXT",
 }
 
 # Fields that callers may update through ``set_status``.
@@ -826,6 +829,7 @@ def _from_row(row: sqlite3.Row) -> Ticket:
         review_reasons=_string_list(row["review_reasons"]),
         review_attempts=int(row["review_attempts"] or 0),
         approval_hash=row["approval_hash"],
+        task_id=row["task_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],

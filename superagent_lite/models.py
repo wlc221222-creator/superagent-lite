@@ -98,6 +98,10 @@ class Ticket:
     started_at: str | None = None
     heartbeat_at: str | None = None
     finished_at: str | None = None
+    # One user task can have several execution tickets over its lifetime.
+    task_id: str | None = None
+    # Populated at dispatch, not stored on the ticket or used by the gate.
+    context: str = ""
 
     @property
     def is_terminal(self) -> bool:

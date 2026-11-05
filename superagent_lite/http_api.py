@@ -57,7 +57,7 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterable, Mapping
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from .artifacts import (
     ArtifactError,
@@ -84,6 +84,7 @@ _ARTIFACTS_INDEX = re.compile(rf"^/tickets/{_TICKET_ID}/artifacts/?$")
 _ARTIFACT_FILE = re.compile(rf"^/tickets/{_TICKET_ID}/artifacts/(?P<name>.+)$")
 _APPROVE_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/approve/?$")
 _REJECT_PATH = re.compile(rf"^/tickets/{_TICKET_ID}/reject/?$")
+_TASK_PATH = re.compile(rf"^/tasks/{_TICKET_ID}/?$")
 
 FEISHU_PATH = "/channels/feishu"
 
@@ -134,6 +135,13 @@ class _Server(ThreadingHTTPServer):
         self.channel_log = channel_log
         self.feishu_client = feishu_client
         self.feishu_deduper = EventDeduper()
+        if isinstance(brain, Brain):
+            brain.start()
+
+    def server_close(self) -> None:
+        if isinstance(self.brain, Brain):
+            self.brain.stop()
+        super().server_close()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -162,6 +170,24 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authorized():
             return
 
+        if path in ("/tasks", "/tasks/"):
+            user_id = parse_qs(urlsplit(self.path).query).get("user_id", ["http"])[0]
+            tasks = self.server.brain.tasks.list(user_id=user_id)
+            self._send_json(HTTPStatus.OK, {"tasks": [
+                {**self.server.brain.task_reply(task).to_dict(), "request": task.request}
+                for task in tasks
+            ]})
+            return
+        match = _TASK_PATH.match(path)
+        if match:
+            task = self.server.brain.tasks.get(match.group("id"))
+            if task is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": "task not found"})
+            else:
+                self._send_json(HTTPStatus.OK, {
+                    **self.server.brain.task_reply(task).to_dict(), "request": task.request,
+                })
+            return
         if path in ("/attention", "/attention/"):
             tickets = self.server.brain.router.list(status=None, limit=500)
             self._send_json(
@@ -531,6 +557,7 @@ def ticket_dict(ticket: Ticket) -> dict[str, Any]:
         "status": ticket.status.value,
         "worker": ticket.worker,
         "origin": ticket.origin,
+        "task_id": ticket.task_id,
         "workdir": ticket.workdir,
         "depends_on": list(ticket.depends_on),
         "result_summary": ticket.result_summary,

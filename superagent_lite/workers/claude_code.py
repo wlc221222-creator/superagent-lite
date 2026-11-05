@@ -69,12 +69,13 @@ class ClaudeCodeWorker(Worker):
             {"claude_bin": None, "claude_binary": self.binary}, env=self.env
         )
 
-    def build_command(self, task: str, workdir: str | os.PathLike[str] | None = None) -> list[str]:
+    def build_command(self, task: str, workdir: str | os.PathLike[str] | None = None,
+                      *, context: str = "") -> list[str]:
         cwd = str(workdir) if workdir is not None else "."
         command = [
             self.resolved_binary(),
             "-p",
-            build_prompt(task, cwd),
+            build_prompt(task, cwd, context=context),
             "--allowedTools",
             ",".join(self.allowed_tools),
             "--add-dir",
@@ -100,7 +101,7 @@ class ClaudeCodeWorker(Worker):
         on_heartbeat: Callable[[], None] | None = None,
     ) -> WorkerResult:
         started = time.monotonic()
-        command = self.build_command(ticket.description, workdir)
+        command = self.build_command(ticket.description, workdir, context=ticket.context)
         append_log(
             ticket.log_path,
             "\n".join(

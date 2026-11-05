@@ -72,7 +72,7 @@ class BrainEventTests(BrainCase):
         self.assertEqual(last["timed_out"], reply.timed_out)
         self.assertEqual(last["model"], reply.model)
         self.assertEqual(set(last), {"type", "reply", "mode", "ticket_ids",
-                                     "timed_out", "model"})
+                                     "timed_out", "model", "task_id", "task_status"})
 
     def test_ticket_updates_are_emitted_only_on_change(self) -> None:
         self.script(PLAN_ONE)

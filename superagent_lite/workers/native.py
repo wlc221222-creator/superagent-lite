@@ -58,8 +58,10 @@ Rules:
 is resolved relative to that directory; paths that escape it are rejected.
 - Use the tools rather than describing what should be done. Read before you \
 edit, and verify your work (for example by reading the file back or running it).
-- Do not ask questions and do not wait for confirmation: pick the most \
-reasonable interpretation of the task and finish it.
+- Decide ordinary implementation details yourself. If completing the task \
+requires a material user decision that the context does not answer, stop \
+with status "failed" and put one concrete question in the summary so the \
+main agent can ask it. Do not invent that decision.
 - When the task is complete, stop calling tools and reply with the mandatory \
 RESULT line described in the task. The RESULT line is the only thing the \
 caller reads; prose before it is ignored.
@@ -252,7 +254,7 @@ class NativeWorker(Worker):
         messages: list[dict[str, Any]] = [
             {
                 "role": "user",
-                "content": build_prompt(ticket.description, root),
+                "content": build_prompt(ticket.description, root, context=ticket.context),
             }
         ]
 

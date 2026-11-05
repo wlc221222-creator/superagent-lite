@@ -8,6 +8,32 @@ DeepSeek's Super-agent.
 
 This is the MVP: standard library only, SQLite persistence, a single CLI.
 
+### Ongoing tasks (unreleased)
+
+The main agent now keeps a **Task** beyond one chat call or execution ticket.
+It preserves the original request and constraints, routes follow-ups to the
+same work, and checks the whole delivery rather than treating every ticket's
+`done` status as success for the user's request. Workers keep technical decisions;
+the default is one coherent ticket, not a speculative multi-step technical plan.
+
+The HTTP coordinator continues after a chat timeout. The web page fetches the
+final Task result and the response is recorded in the originating user's history.
+`GET /tasks/<id>` returns the task's reply, `task_status` and all `ticket_ids`;
+`GET /tasks?user_id=web` lists that conversation's recent tasks. Both require the
+same token as the ticket APIs. Chat replies for work include `task_id` and
+`task_status`; direct conversational replies keep their old response shape.
+
+Task delivery decisions are `ready`, `continue`, `needs_input`, or `failed`.
+Continuation returns a specific delivery gap to the worker in the same directory,
+with a default limit of three execution batches (`brain_max_rounds`). Approval
+continues to apply to new execution tickets. The existing per-ticket reviewer is
+unchanged; **the Brain also receives current artifact excerpts for task delivery
+assessment**, using the configured review byte caps and redaction helper.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the DeepSeek reference mapping,
+follow-up behavior, cost model and current limits. This is task-level continuity,
+not yet live steering of a running worker or final-result push to every channel.
+
 ## Architecture
 
 ```
@@ -91,51 +117,55 @@ persisted in SQLite, so a restart loses nothing.
 A non-daemon `run`/`show`/`list` still recovers stale tickets, but it fails
 them (iteration 2 behaviour) rather than requeueing them.
 
-### The Brain: chat, planning and tickets (phase 3, milestone B)
+### The Brain: routing, ongoing tasks and delivery
 
 Users talk only to the main agent. `superagent chat` (CLI REPL) and
 `superagent serve` (HTTP) share one `Brain`, so both behave identically:
 
 ```
-user sentence
-      │
-      ▼
-  Brain ──▶ planner model (/v1/messages, cheap model by default)
-      │
-      ├── "reply"  ─────────────────────────────▶ direct answer, no ticket
-      │
-      └── "plan"   ──▶ 1..N tickets (depends_on) ──▶ SQLite queue
+user sentence → Brain router
+                  ├── reply / task status → answer
+                  ├── followup → existing Task, same workspace
+                  └── plan → new Task with original request and context
+                                  │
+                           execution tickets → SQLite queue → workers
+                                  ▲                            │
+                                  │                      reports + artifacts
+                                  │                            ▼
+                                  └── delivery gap ← goal-level assessment
                                                        │
-                                             superagentd executes them
+                                              ready / needs_input / failed
                                                        │
-                        structured results ◀───────────┘
-                              │
-                              ▼
-                     summarize → one reply
+                                               original conversation
 ```
 
-- **Decomposition** -- the planner returns JSON: either
-  `{"action": "reply", "reply": "..."}` or
+- **Routing** -- the planner returns JSON: either
+  `{"action": "reply", "reply": "..."}`, `followup` / `status` with a `task_id`, or
   `{"action": "plan", "workdir": ..., "tickets": [{"id", "description",
-  "worker", "depends_on"}]}`. Ticket descriptions must stand alone because a
-  worker only sees its own description. All tickets of one request share a
+  "worker", "depends_on"}]}`. Default to one coherent execution; split only
+  genuinely independent deliverables. Workers receive the original request,
+  its context and previous reports as well as the ticket description.
+  All tickets of one request share a
   working directory (the absolute path the user named, else a private
-  `runtime/work/brain_<stamp>/`), so later steps can use earlier output.
+  `runtime/work/<task_id>/`), so later attempts can use earlier output.
 - **Dependencies** -- `depends_on` is persisted and enforced by the store: a
   ticket is only handed out once every prerequisite is `done`. A failed
   prerequisite fails its dependents (transitively, from every path that writes
   `failed`) instead of parking them forever. Independent tickets in a plan
   still run in parallel.
-- **Waiting** -- `chat`/`POST /chat` poll the tickets for
+- **Waiting** -- `chat`/`POST /chat` wait for task delivery for
   `chat_timeout_seconds`; if they are not all terminal in time, the reply
-  lists the ticket ids (and their statuses) so the caller can ask again.
+  includes the task and ticket ids. The HTTP coordinator keeps progressing
+  the Task after that reply; `GET /tasks/<id>` returns its eventual delivery.
   `POST /chat/stream` runs the same chat and reports progress as server-sent
   events (`accepted` -> `planning` -> `tickets` -> `ticket` per status change
   -> `done`, or `error`), which is what the web page shows in its status line.
-- **Summary** -- the planner model receives the workers' *structured* results
-  (status, summary, artifacts, error as JSON) and writes the final answer. It
-  is told not to claim success the ticket data does not show; a failed ticket
-  is reported as failed.
+- **Delivery** -- the Brain compares the original request and explicit user
+  updates against structured execution reports and current artifact excerpts.
+  `ready` delivers; `continue` returns a concrete unmet requirement to the
+  worker; `needs_input` asks a human decision; `failed` reports inability to
+  complete. This is a model judgement, not independent runtime verification.
+  Technical investigation and solution choices stay with the Worker.
 - **Memory** -- `memory.md` (path configurable) is injected into the planner
   prompt, truncated to `brain_memory_max_chars` (default 2000, keeping the
   beginning of the file). It is maintained by hand; nothing is auto-distilled.
@@ -183,6 +213,8 @@ or a reply. Only the model name is configurable:
 | `POST /chat` `{"text": "...", "user_id": "..."}` | `{"reply", "mode", "ticket_ids", "timed_out", "model"}`; `mode` is `reply` / `summary` / `pending` (timeout) / `error` (502) |
 | `POST /chat/stream` (same body/auth) | `text/event-stream` of `data: {json}` events: `accepted`, `planning`, `tickets`, `ticket` (status change), then `done` (same fields as `/chat`) or `error`; `: ping` comments every 15 s |
 | `GET /tickets/<id>` | the ticket, including `status`, `artifacts`, `result_summary`, `depends_on` |
+| `GET /tasks/<id>` | persisted task delivery (`reply`, `task_status`, `ticket_ids`) |
+| `GET /tasks?user_id=...` | recent tasks in that user's conversation |
 | `GET /tickets/<id>/artifacts` | `{"ticket_id", "artifacts": [{"name", "size", "exists", "url"}]}` |
 | `GET /tickets/<id>/artifacts/<name>` | the artifact bytes, with a guessed `Content-Type` and `Content-Disposition: attachment` |
 | `POST /channels/feishu` | Feishu event webhook (see below) |
@@ -200,9 +232,10 @@ authenticated like any other client's.
 
 Open `http://<host>:<port>/` and paste the token into the field at the top
 right (it is kept in `sessionStorage`, never in the URL). The page posts your
-message to `/chat`, prints the reply, and if the reply carries ticket ids it
-polls `GET /tickets/<id>` to show each ticket's status, summary and artifact
-links. Downloads go through `GET /tickets/<id>/artifacts/<name>` with the same
+message to `/chat/stream` (falling back to `/chat`), prints the reply, and
+polls `GET /tasks/<id>` for ongoing work. Execution details and artifact links
+still come from `GET /tickets/<id>`. Recent tasks are restored after reload.
+Downloads go through `GET /tickets/<id>/artifacts/<name>` with the same
 token. The whole page is one HTML document with inline CSS/JS in
 `superagent_lite/webui.py` -- no CDN, no build step.
 
@@ -630,7 +663,8 @@ superagent_lite/
 ├── store.py             # SQLite queue: atomic claim, leases, requeue, recovery, depends_on
 ├── router.py            # enqueue / dispatch / heartbeat / result judgement
 ├── daemon.py            # superagentd: pool, watchdog, graceful shutdown
-├── brain.py             # planner: reply-or-decompose, enqueue, wait, summarize
+├── brain.py             # task routing, background progression, goal delivery
+├── tasks.py             # durable user tasks, context, follow-ups and assignments
 ├── planner.py           # /v1/messages client; endpoint read from ~/.claude/settings.json
 ├── memory.py            # memory.md loading + truncation
 ├── http_api.py          # /chat, /tickets, artifact download, Feishu webhook, auth
@@ -671,7 +705,8 @@ main.py                  # equivalent entry point
 - **Messaging channels** — Feishu is a skeleton; add signed-request
   verification, more event types and other platforms (Slack, Telegram).
 - **Web UI** — the page is functional but minimal: no conversation history,
-  no per-user sessions, no artifact preview.
+  no per-user login, no artifact preview. Conversation history and ongoing tasks
+  are stored; full chat-history rendering is still minimal.
 - **Automatic memory distillation** — write `memory.md` from finished chats.
 - **Multi-daemon** — claims and leases are already atomic; a coordinator or
   a shared watchdog would let several hosts drain one queue.

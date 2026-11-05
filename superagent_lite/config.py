@@ -102,6 +102,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # planning only, and only when explicitly enabled.
     "brain_escalate_on_complex": False,
     "brain_max_tickets": 8,
+    # Includes the first execution; later rounds address delivery gaps, not
+    # a second detailed technical plan from the router.
+    "brain_max_rounds": 3,
     "brain_settings_path": "~/.claude/settings.json",
     "brain_max_tokens": 2048,
     "brain_timeout_seconds": 120.0,
@@ -299,6 +302,9 @@ def normalize_config(values: dict[str, Any] | None) -> dict[str, Any]:
         raise ValueError("config.brain_max_tickets must be an integer")
     if config["brain_max_tickets"] < 1:
         raise ValueError("config.brain_max_tickets must be at least 1")
+    if (type(config["brain_max_rounds"]) is not int
+            or config["brain_max_rounds"] < 1):
+        raise ValueError("config.brain_max_rounds must be a positive integer")
     if not isinstance(config["brain_escalate_on_complex"], bool):
         raise ValueError("config.brain_escalate_on_complex must be a boolean")
 

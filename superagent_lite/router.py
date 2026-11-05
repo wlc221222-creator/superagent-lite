@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import re
 import threading
 import time
@@ -178,6 +179,8 @@ class Router:
         depends_on: Iterable[str] | None = None,
         workdir: str | Path | None = None,
         origin: str = "cli",
+        task_id: str | None = None,
+        ticket_id: str | None = None,
     ) -> Ticket:
         """Create a ticket and return it immediately.
 
@@ -200,8 +203,12 @@ class Router:
         if not description:
             raise ValueError("task description must not be empty")
 
+        if ticket_id is not None:
+            existing = self.store.get(ticket_id)
+            if existing is not None:
+                return existing
         adapter = self._resolve_worker(worker)
-        ticket_id = new_ticket_id()
+        ticket_id = ticket_id or new_ticket_id()
         dependencies = [str(item) for item in (depends_on or []) if str(item)]
         gated = self.is_gated(description)
         ticket = Ticket(
@@ -220,6 +227,7 @@ class Router:
             max_retries=int(self.config["max_retries"]),
             depends_on=dependencies,
             origin=str(origin or "cli"),
+            task_id=task_id,
             review_status=REVIEW_NONE,
             approval_hash=approval_content_hash(description) if gated else None,
         )
@@ -802,6 +810,44 @@ class Router:
         heartbeat: "_Heartbeat",
     ) -> WorkerResult:
         """Call ``adapter.run``, supplying a heartbeat hook when supported."""
+
+        from .tasks import TaskStore, task_context
+
+        context = []
+        if ticket.task_id:
+            tasks = TaskStore(self.store.path)
+            try:
+                task = tasks.get(ticket.task_id)
+                if task is not None:
+                    context.append(task_context(task))
+                    previous_ids = [item for item in task.ticket_ids if item != ticket.id]
+                    previous_results = []
+                    for previous_id in previous_ids:
+                        previous = self.store.get(previous_id)
+                        if previous is not None and previous.is_terminal:
+                            previous_results.append({
+                                "id": previous.id, "status": previous.status.value,
+                                "summary": previous.result_summary, "error": previous.error,
+                                "artifacts": previous.artifacts, "workdir": previous.workdir,
+                            })
+                    context.append("Previous task execution reports:\n"
+                                   + json.dumps(previous_results, ensure_ascii=False))
+            finally:
+                tasks.close()
+        predecessors = []
+        for dependency in ticket.depends_on:
+            previous = self.store.get(dependency)
+            if previous is not None:
+                predecessors.append({
+                    "id": previous.id, "description": previous.description,
+                    "status": previous.status.value, "summary": previous.result_summary,
+                    "artifacts": previous.artifacts, "workdir": previous.workdir,
+                    "error": previous.error,
+                })
+        if predecessors:
+            context.append("Earlier execution results (reports, not verified facts):\n"
+                           + json.dumps(predecessors, ensure_ascii=False))
+        ticket.context = "\n\n".join(context)
 
         def beat() -> None:
             heartbeat.tick()

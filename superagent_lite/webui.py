@@ -139,7 +139,7 @@ CHAT_PAGE = """<!doctype html>
   <main id="log">
     <div class="msg">
       <div class="meta">agent</div>
-      你好，我是主智能体。输入任务，我会拆成工单交给执行代理；完成后在这里汇总结果。
+      告诉我你想完成什么。我会跟进任务，在这里交付结果，需要你决定时再询问。
       若已设置 <code>SUPERAGENT_HTTP_TOKEN</code>，请先在右上角填入 token。
     </div>
   </main>
@@ -362,6 +362,35 @@ CHAT_PAGE = """<!doctype html>
     tick();
   }
 
+  function pollTask(answer, taskId) {
+    var panel = document.createElement("div");
+    panel.className = "progress";
+    answer.appendChild(panel);
+    function tick() {
+      api("/tasks/" + encodeURIComponent(taskId)).then(function (data) {
+        answer.querySelector(".body").textContent = data.reply;
+        var labels = {working: "处理中", planning: "正在派单", ready: "已交付",
+                      needs_input: "需要你的决定", failed: "未完成",
+                      awaiting_approval: "等待审批"};
+        answer.querySelector(".meta").textContent = "agent · " +
+          (labels[data.task_status] || data.task_status);
+        return Promise.all((data.ticket_ids || []).map(function (id) {
+          return api("/tickets/" + encodeURIComponent(id));
+        })).then(function (tickets) {
+          panel.textContent = "";
+          tickets.forEach(function (ticket, index) { renderProgress(panel, ticket, index); });
+          if (["ready", "needs_input", "failed"].indexOf(data.task_status) < 0) {
+            setTimeout(tick, POLL_MS);
+          }
+        });
+      }).catch(function () {
+        answer.querySelector(".meta").textContent = "暂时无法获取任务进度，正在重连";
+        setTimeout(tick, POLL_MS);
+      });
+    }
+    tick();
+  }
+
   function finishAnswer(data) {
     var answer = bubble("agent", data.reply || "(empty reply)");
     var meta = answer.querySelector(".meta");
@@ -375,9 +404,23 @@ CHAT_PAGE = """<!doctype html>
       idLine.className = "meta";
       idLine.textContent = "tickets: " + ids.join(", ");
       answer.insertBefore(idLine, answer.querySelector(".body").nextSibling);
-      pollTickets(answer, ids);
+      if (data.task_id) { pollTask(answer, data.task_id); }
+      else { pollTickets(answer, ids); }
     }
     return answer;
+  }
+
+  var tasksRestored = false;
+  function restoreTasks() {
+    if (tasksRestored) { return; }
+    api("/tasks?user_id=web").then(function (data) {
+      if (tasksRestored) { return; }
+      tasksRestored = true;
+      (data.tasks || []).slice().reverse().forEach(function (task) {
+        bubble("user", task.request);
+        finishAnswer(task);
+      });
+    }).catch(function () { /* Retry after the user saves a valid token. */ });
   }
 
   function showFailure(message) {
@@ -396,6 +439,7 @@ CHAT_PAGE = """<!doctype html>
   }
 
   function statusText(event) {
+    if (event.type === "reviewing") { return "正在核对整体交付…"; }
     if (event.type === "accepted") { return "已收到"; }
     if (event.type === "planning") { return "正在规划…"; }
     if (event.type === "tickets") {
@@ -545,6 +589,7 @@ CHAT_PAGE = """<!doctype html>
     var button = this;
     setTimeout(function () { button.textContent = "保存"; }, 1200);
     refreshAttention();
+    restoreTasks();
   });
   messageEl.addEventListener("keydown", function (event) {
     if (event.key === "Enter" && !event.shiftKey) {
@@ -554,6 +599,7 @@ CHAT_PAGE = """<!doctype html>
   });
   messageEl.focus();
   refreshAttention();
+  restoreTasks();
 })();
 </script>
 </body>

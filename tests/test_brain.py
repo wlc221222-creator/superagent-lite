@@ -125,11 +125,13 @@ class RecordingWorker(Worker):
         self.name = name
         self.fail = fail
         self.seen: list[str] = []
+        self.contexts: list[str] = []
         self._lock = threading.Lock()
 
     def run(self, ticket, workdir: Path) -> WorkerResult:
         with self._lock:
             self.seen.append(ticket.description)
+            self.contexts.append(ticket.context)
         if self.fail:
             return WorkerResult(
                 success=False, summary="", error="simulated worker failure"
@@ -176,6 +178,12 @@ class BrainCase(unittest.TestCase):
     # -- helpers --------------------------------------------------------
     def script(self, *answers: str) -> None:
         """Make the planner return ``answers`` in order (then the last one)."""
+
+        # Existing fixtures name the visible reply; delivery now uses a
+        # structured decision rather than accepting bare summary prose.
+        answers = tuple(json.dumps({"action": "ready", "reply": answer})
+                        if answer.startswith("SUMMARY:") else answer
+                        for answer in answers)
 
         def responder(_payload, index):
             return answers[min(index, len(answers) - 1)]

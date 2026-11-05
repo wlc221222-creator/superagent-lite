@@ -54,11 +54,21 @@ class ContractOutcome:
     error: str | None = None
 
 
-def build_prompt(task: str, workdir: str | os.PathLike[str]) -> str:
+def build_prompt(task: str, workdir: str | os.PathLike[str], *, context: str = "") -> str:
     """Append the mandatory result-contract instructions to ``task``."""
 
     instructions = CONTRACT_INSTRUCTIONS.format(workdir=str(workdir))
-    return f"{str(task).rstrip()}\n\n{instructions}\n"
+    background = (
+        "\n\nTask context and previous reports:\n" + context
+        + "\nKeep the original request and its constraints in view. Treat previous "
+        "reports as leads to verify, not proof. Make technical decisions from the "
+        "actual workspace. State checks performed and unresolved issues in your "
+        "result summary; write a handoff artifact if the details need more space. "
+        "If a necessary user decision is missing, report failed with one concrete "
+        "question in the summary for the main agent to relay. Decide ordinary "
+        "implementation details yourself."
+    ) if context else ""
+    return f"{str(task).rstrip()}{background}\n\n{instructions}\n"
 
 
 def _strip_fence(line: str) -> str:

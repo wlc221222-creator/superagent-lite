@@ -11,3 +11,6 @@ venv/
 runtime/
 config.json
 .env
+
+# Local browser verification artifacts
+output/
